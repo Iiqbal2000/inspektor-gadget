@@ -27,7 +27,6 @@ import (
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/testutils"
 	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
 
 const (
@@ -39,6 +38,7 @@ const (
 func TestRuntimeClientInterface(t *testing.T) {
 	t.Parallel()
 	utilstest.RequireRoot(t)
+	utilstest.HostInit(t)
 
 	for _, runtime := range testutils.SupportedContainerRuntimes {
 		t.Run(runtime.String(), func(t *testing.T) {
@@ -67,13 +67,11 @@ func TestRuntimeClientInterface(t *testing.T) {
 					&runtimeclient.ContainerDetailsData{
 						ContainerData: runtimeclient.ContainerData{
 							Runtime: runtimeclient.RuntimeContainerData{
-								BasicRuntimeMetadata: types.BasicRuntimeMetadata{
-									RuntimeName:        runtime,
-									ContainerName:      cn,
-									ContainerID:        c.ID(),
-									ContainerImageName: containerImageName,
-								},
-								State: runtimeclient.StateRunning,
+								RuntimeName:        runtime,
+								ContainerName:      cn,
+								ContainerID:        c.ID(),
+								ContainerImageName: containerImageName,
+								State:              runtimeclient.StateRunning,
 							},
 							K8s: runtimeclient.K8sContainerData{},
 						},
@@ -108,7 +106,7 @@ func TestRuntimeClientInterface(t *testing.T) {
 					found := false
 					for _, cData := range containers {
 						// ContainerImageDigest may vary among versions, so we do not check it for now
-						cData.Runtime.BasicRuntimeMetadata.ContainerImageDigest = ""
+						cData.Runtime.ContainerImageDigest = ""
 						if cmp.Equal(*cData, eData.ContainerData) {
 							found = true
 							break
@@ -125,7 +123,7 @@ func TestRuntimeClientInterface(t *testing.T) {
 				for _, eData := range expectedData {
 					cData, err := rc.GetContainer(eData.Runtime.ContainerID)
 					// ContainerImageDigest may vary among versions, so we do not check it for now
-					cData.Runtime.BasicRuntimeMetadata.ContainerImageDigest = ""
+					cData.Runtime.ContainerImageDigest = ""
 					require.Nil(t, err)
 					require.NotNil(t, cData)
 					require.True(t, cmp.Equal(*cData, eData.ContainerData),
@@ -139,7 +137,7 @@ func TestRuntimeClientInterface(t *testing.T) {
 				for _, eData := range expectedData {
 					cData, err := rc.GetContainerDetails(eData.Runtime.ContainerID)
 					// ContainerImageDigest may vary among versions, so we do not check it for now
-					cData.Runtime.BasicRuntimeMetadata.ContainerImageDigest = ""
+					cData.Runtime.ContainerImageDigest = ""
 					require.Nil(t, err)
 					require.NotNil(t, cData)
 

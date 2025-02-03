@@ -87,6 +87,10 @@ func (t *Tracer) install() error {
 		return fmt.Errorf("getting a perf reader: %w", err)
 	}
 
+	if err := gadgets.FreezeMaps(t.objs.Events); err != nil {
+		return err
+	}
+
 	t.progLink, err = link.Kprobe("audit_seccomp", t.objs.IgAuditSecc, nil)
 	if err != nil {
 		return fmt.Errorf("attaching kprobe: %w", err)
@@ -104,9 +108,9 @@ func (t *Tracer) run() {
 				return
 			}
 
-			msg := fmt.Sprintf("Error reading perf ring buffer: %s", err)
-			t.eventCallback(types.Base(eventtypes.Err(msg)))
-			return
+			msg := fmt.Sprintf("reading perf ring buffer: %s", err)
+			t.eventCallback(types.Base(eventtypes.Warn(msg)))
+			continue
 		}
 
 		if record.LostSamples > 0 {

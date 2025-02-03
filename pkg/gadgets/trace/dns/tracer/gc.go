@@ -26,7 +26,6 @@ import (
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
 
@@ -42,13 +41,11 @@ const garbageCollectorBatchSize = 256
 // are deleted from the map.
 //
 // The garbage collector goroutine terminates when the context is done.
-func startGarbageCollector(ctx context.Context, logger logger.Logger, gadgetParams *params.Params, queryMap *ebpf.Map) {
-	if !gadgets.DetectBpfKtimeGetBootNs() {
+func startGarbageCollector(ctx context.Context, logger logger.Logger, dnsTimeout time.Duration, queryMap *ebpf.Map) {
+	if !gadgets.HasBpfKtimeGetBootNs() {
 		logger.Warnf("DNS latency will not be reported (requires Linux kernel 5.8 or later)")
 		return
 	}
-
-	dnsTimeout := gadgetParams.Get(ParamDNSTimeout).AsDuration()
 
 	logger.Debugf("starting garbage collection for DNS tracer with dnsTimeout %s", dnsTimeout)
 	go func() {
@@ -83,17 +80,11 @@ func startGarbageCollector(ctx context.Context, logger logger.Logger, gadgetPara
 func collectGarbage(dnsTimeout time.Duration, queryMap *ebpf.Map, keysBatch []dnsQueryKeyT, valuesBatch []uint64) (int, error) {
 	var (
 		keysToDelete []dnsQueryKeyT
-		prevKeyOut   interface{}
-		nextKeyOut   dnsQueryKeyT
+		cursor       ebpf.MapBatchCursor
 	)
 
-	// Nil means start from the beginning.
-	// Type of prevKeyOut is interface{}, not dnsQueryKeyT, to ensure that the first call
-	// to BatchLookup sees an untyped nil (not an interface with value nil); otherwise it crashes.
-	prevKeyOut = nil
-
 	for {
-		n, err := queryMap.BatchLookup(prevKeyOut, &nextKeyOut, keysBatch, valuesBatch, nil)
+		n, err := queryMap.BatchLookup(&cursor, keysBatch, valuesBatch, nil)
 		if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return 0, fmt.Errorf("looking up keys in query map: %w", err)
 		}
@@ -110,8 +101,6 @@ func collectGarbage(dnsTimeout time.Duration, queryMap *ebpf.Map, keysBatch []dn
 			// This error means there are no more keys after the ones we just read.
 			break
 		}
-
-		prevKeyOut = nextKeyOut
 	}
 
 	if len(keysToDelete) == 0 {

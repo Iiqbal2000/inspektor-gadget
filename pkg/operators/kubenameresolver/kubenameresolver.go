@@ -37,9 +37,7 @@ type KubeNameResolverInterface interface {
 	SetLocalPodDetails(owner, hostIP, podIP string, labels map[string]string)
 }
 
-type KubeNameResolver struct {
-	k8sInventory *common.K8sInventoryCache
-}
+type KubeNameResolver struct{}
 
 func (k *KubeNameResolver) Name() string {
 	return OperatorName
@@ -71,30 +69,29 @@ func (k *KubeNameResolver) CanOperateOn(gadget gadgets.GadgetDesc) bool {
 }
 
 func (k *KubeNameResolver) Init(params *params.Params) error {
-	k8sInventory, err := common.GetK8sInventoryCache()
-	if err != nil {
-		return fmt.Errorf("creating k8s inventory cache: %w", err)
-	}
-	k.k8sInventory = k8sInventory
 	return nil
 }
 
 func (k *KubeNameResolver) Close() error {
-	k.k8sInventory.Close()
 	return nil
 }
 
 func (k *KubeNameResolver) Instantiate(gadgetCtx operators.GadgetContext, gadgetInstance any, params *params.Params) (operators.OperatorInstance, error) {
+	k8sInventory, err := common.GetK8sInventoryCache()
+	if err != nil {
+		return nil, fmt.Errorf("creating k8s inventory cache: %w", err)
+	}
+
 	return &KubeNameResolverInstance{
 		gadgetCtx:      gadgetCtx,
-		manager:        k,
+		k8sInventory:   k8sInventory,
 		gadgetInstance: gadgetInstance,
 	}, nil
 }
 
 type KubeNameResolverInstance struct {
 	gadgetCtx      operators.GadgetContext
-	manager        *KubeNameResolver
+	k8sInventory   common.K8sInventoryCache
 	gadgetInstance any
 }
 
@@ -103,12 +100,12 @@ func (m *KubeNameResolverInstance) Name() string {
 }
 
 func (m *KubeNameResolverInstance) PreGadgetRun() error {
-	m.manager.k8sInventory.Start()
+	m.k8sInventory.Start()
 	return nil
 }
 
 func (m *KubeNameResolverInstance) PostGadgetRun() error {
-	m.manager.k8sInventory.Stop()
+	m.k8sInventory.Stop()
 	return nil
 }
 
@@ -116,22 +113,19 @@ func (m *KubeNameResolverInstance) enrich(ev any) {
 	kubeNameResolver, _ := ev.(KubeNameResolverInterface)
 	containerInfo, _ := ev.(operators.ContainerInfoGetters)
 
-	pods := m.manager.k8sInventory.GetPods()
-	for i, pod := range pods.Items {
-		if pod.Namespace == containerInfo.GetNamespace() && pod.Name == containerInfo.GetPod() {
-			owner := ""
-			// When the pod belongs to Deployment, ReplicaSet or DaemonSet, find the
-			// shorter name without the random suffix. That will be used to
-			// generate the network policy name.
-			if pods.Items[i].OwnerReferences != nil {
-				nameItems := strings.Split(pods.Items[i].Name, "-")
-				if len(nameItems) > 2 {
-					owner = strings.Join(nameItems[:len(nameItems)-2], "-")
-				}
+	pod := m.k8sInventory.GetPodByName(containerInfo.GetNamespace(), containerInfo.GetPod())
+	if pod != nil {
+		owner := ""
+		// When the pod belongs to Deployment, ReplicaSet or DaemonSet, find the
+		// shorter name without the random suffix. That will be used to
+		// generate the network policy name.
+		if pod.OwnerReferences != nil {
+			nameItems := strings.Split(pod.Name, "-")
+			if len(nameItems) > 2 {
+				owner = strings.Join(nameItems[:len(nameItems)-2], "-")
 			}
-			kubeNameResolver.SetLocalPodDetails(owner, pod.Status.HostIP, pod.Status.PodIP, pod.Labels)
-			return
 		}
+		kubeNameResolver.SetLocalPodDetails(owner, pod.Status.HostIP, pod.Status.PodIP, pod.Labels)
 	}
 }
 

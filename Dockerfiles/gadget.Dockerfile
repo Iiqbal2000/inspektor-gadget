@@ -1,17 +1,18 @@
 # Dockerfile for Inspektor Gadget.
 
-ARG BUILDER_IMAGE=golang:1.19-bullseye
-ARG BASE_IMAGE=debian:bullseye-slim
+ARG BUILDER_IMAGE=golang:1.23.4-bullseye@sha256:6d4cbf0b3900afa3e4460ca995b6c351370ce8d2d44b7a964dc521ab640e1a88
+ARG BASE_IMAGE=gcr.io/distroless/static-debian12@sha256:ce46866b3a5170db3b49364900fb3168dc0833dfb46c26da5c77f22abb01d8c3
 
-# bpftrace upstream image
-ARG BPFTRACE="ghcr.io/inspektor-gadget/bpftrace"
-
-FROM ${BPFTRACE} as bpftrace
 # Prepare and build gadget artifacts in a container
-FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} as builder
+FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} AS builder
 
 ARG TARGETARCH
 ARG BUILDARCH
+ARG VERSION=v0.0.0
+ENV VERSION=${VERSION}
+
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY}
 
 # Cache go modules so they won't be downloaded at each build
 COPY go.mod go.sum /gadget/
@@ -31,26 +32,7 @@ LABEL org.opencontainers.image.description="Inspektor Gadget is a collection of 
 LABEL org.opencontainers.image.documentation="https://inspektor-gadget.io/docs"
 LABEL org.opencontainers.image.licenses=Apache-2.0
 
-# install runtime dependencies  according to the package manager
-# available on the base image
-RUN set -ex; \
-	PACKAGES='ca-certificates util-linux socat' && \
-	if command -v tdnf; then \
-		tdnf install -y $PACKAGES; \
-	elif command -v yum; then \
-		yum install -y $PACKAGES; \
-	elif command -v apt-get; then \
-		apt-get update && \
-		apt-get install -y $PACKAGES && \
-		apt-get clean && \
-		rm -rf /var/lib/apt/lists/*; \
-	elif command -v apk; then \
-		apk add gcompat $PACKAGES; \
-	fi && \
-	(rmdir /usr/src || true) && ln -sf /host/usr/src /usr/src && \
-	rm -f /etc/localtime && ln -sf /host/etc/localtime /etc/localtime
-
-COPY gadget-container/entrypoint.sh gadget-container/cleanup.sh /
+COPY --from=builder /gadget/gadget-container/bin/cleanup /
 
 COPY --from=builder /gadget/gadget-container/bin/gadgettracermanager /bin/
 
@@ -68,8 +50,3 @@ COPY --from=builder /gadget/gadget-container/bin/nrigadget /opt/hooks/nri/
 COPY gadget-container/hooks/nri/conf.json /opt/hooks/nri/
 
 ## Hooks Ends
-
-COPY --from=bpftrace /usr/bin/bpftrace /usr/bin/bpftrace
-
-# Mitigate https://github.com/kubernetes/kubernetes/issues/106962.
-RUN rm -f /var/run

@@ -71,9 +71,25 @@ struct syscall_context {
 	// We could add more fields for the arguments if desired
 };
 
+// man clone(2):
+//   If any of the threads in a thread group performs an
+//   execve(2), then all threads other than the thread group
+//   leader are terminated, and the new program is executed in
+//   the thread group leader.
+//
+// sys_enter_execve might be called from a thread and the corresponding
+// sys_exit_execve will be called from the thread group leader in case of
+// execve success, or from the same thread in case of execve failure.
+//
+// Moreover, checking ctx->ret == 0 is not a reliable way to distinguish
+// successful execve from failed execve because seccomp can change ctx->ret.
+//
+// Therefore, use two different tracepoints to handle the map cleanup:
+// - tracepoint/sched/sched_process_exec is called after a successful execve
+// - tracepoint/syscalls/sys_exit_execve is always called
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(key_size, sizeof(u64));
+	__uint(key_size, sizeof(u32));
 	__uint(value_size, sizeof(struct syscall_context));
 	__uint(max_entries,
 	       1048576); // There can be many threads sleeping in some futex/poll syscalls
@@ -138,8 +154,22 @@ int BPF_KPROBE(ig_trace_cap_e, const struct cred *cred,
 	args.current_userns =
 		(u64)BPF_CORE_READ(task, real_cred, user_ns, ns.inum);
 	args.target_userns = (u64)BPF_CORE_READ(targ_ns, ns.inum);
-	BPF_CORE_READ_INTO(&args.cap_effective, task, real_cred,
-			   cap_effective.cap[0]);
+	/*
+	 * cap_effective has kernel_cap_t for type.
+	 * This type definition changed along the time:
+	 * 1. It was defined as a __u32 in:
+	 * https://github.com/torvalds/linux/commit/1da177e4c3f4
+	 * 2. It later was modified to be an array of __u32, so 64 bits kernel
+	 * can use 64 bits for capabilities while supporting legacy 32 bits
+	 * ones:
+	 * https://github.com/torvalds/linux/commit/e338d263a76a
+	 * 3. It was recently defined to be a simple u64:
+	 * https://github.com/torvalds/linux/commit/f122a08b197d
+	 * BPF_CORE_READ_INTO() will handle the different size for us and in any
+	 * case, we define args.cap_effective as u64 which is enough to contain
+	 * the information.
+	 */
+	BPF_CORE_READ_INTO(&args.cap_effective, task, real_cred, cap_effective);
 	args.cap = cap;
 	args.cap_opt = cap_opt;
 	bpf_map_update_elem(&start, &pid_tgid, &args, 0);
@@ -164,12 +194,12 @@ int BPF_KRETPROBE(ig_trace_cap_x)
 	event.current_userns = ap->current_userns;
 	event.target_userns = ap->target_userns;
 	event.cap_effective = ap->cap_effective;
-	event.pid = pid_tgid >> 32;
-	event.tgid = pid_tgid;
+	event.pid = pid_tgid;
+	event.tgid = pid_tgid >> 32;
 	event.cap = ap->cap;
 	event.uid = (u32)uid_gid;
 	event.gid = (u32)(uid_gid >> 32);
-	event.mntnsid = gadget_get_mntns_id();
+	event.mntnsid = gadget_get_current_mntns_id();
 	bpf_get_current_comm(&event.task, sizeof(event.task));
 	event.ret = PT_REGS_RC(ctx);
 	event.timestamp = bpf_ktime_get_boot_ns();
@@ -183,7 +213,7 @@ int BPF_KRETPROBE(ig_trace_cap_x)
 	}
 
 	struct syscall_context *sc_ctx;
-	sc_ctx = bpf_map_lookup_elem(&current_syscall, &pid_tgid);
+	sc_ctx = bpf_map_lookup_elem(&current_syscall, &event.pid);
 	if (sc_ctx) {
 		event.syscall = sc_ctx->nr;
 	} else {
@@ -198,36 +228,17 @@ int BPF_KRETPROBE(ig_trace_cap_x)
 	return 0;
 }
 
-/*
- * Taken from:
- * https://github.com/seccomp/libseccomp/blob/afbde6ddaec7c58c3b281d43b0b287269ffca9bd/src/syscalls.csv
- */
-#if defined(__TARGET_ARCH_arm64)
-#define __NR_rt_sigreturn 139
-#define __NR_exit_group 94
-#define __NR_exit 93
-#elif defined(__TARGET_ARCH_x86)
-#define __NR_rt_sigreturn 15
-#define __NR_exit_group 231
-#define __NR_exit 60
-#else
-#error "The trace capabilities gadget is not supported on your architecture."
-#endif
-
-static __always_inline int skip_exit_probe(int nr)
-{
-	return !!(nr == __NR_exit || nr == __NR_exit_group ||
-		  nr == __NR_rt_sigreturn);
-}
-
+// raw_tracepoint/sys_enter is updating the current_syscall map with the syscall
+// number. The map will be cleaned up by various tracepoints depending on the
+// syscall.
 SEC("raw_tracepoint/sys_enter")
 int ig_cap_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 {
-	u64 pid_tgid = bpf_get_current_pid_tgid();
+	u32 pid = (u32)bpf_get_current_pid_tgid();
 	struct pt_regs regs = {};
 	struct syscall_context sc_ctx = {};
 
-	u64 mntns_id = gadget_get_mntns_id();
+	u64 mntns_id = gadget_get_current_mntns_id();
 
 	if (gadget_should_discard_mntns_id(mntns_id))
 		return 0;
@@ -235,19 +246,39 @@ int ig_cap_sys_enter(struct bpf_raw_tracepoint_args *ctx)
 	u64 nr = ctx->args[1];
 	sc_ctx.nr = nr;
 
-	// The sys_exit tracepoint is not called for some syscalls.
-	if (!skip_exit_probe(nr))
-		bpf_map_update_elem(&current_syscall, &pid_tgid, &sc_ctx,
-				    BPF_ANY);
+	bpf_map_update_elem(&current_syscall, &pid, &sc_ctx, BPF_ANY);
 
 	return 0;
 }
 
+// raw_tracepoint/sys_exit cleans up the current_syscall map in most cases
 SEC("raw_tracepoint/sys_exit")
 int ig_cap_sys_exit(struct bpf_raw_tracepoint_args *ctx)
 {
-	u64 pid_tgid = bpf_get_current_pid_tgid();
-	bpf_map_delete_elem(&current_syscall, &pid_tgid);
+	u32 pid = (u32)bpf_get_current_pid_tgid();
+	bpf_map_delete_elem(&current_syscall, &pid);
+	return 0;
+}
+
+// tracepoint/sched/sched_process_exec cleans up the current_syscall map after
+// a successful execve because raw_tracepoint/sys_exit might not have access to
+// the correct pid if the execve was performed by a thread
+SEC("tracepoint/sched/sched_process_exec")
+int ig_cap_sched_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+	u32 pid = ctx->old_pid;
+	bpf_map_delete_elem(&current_syscall, &pid);
+	return 0;
+}
+
+// tracepoint/sched/sched_process_exit cleans up the current_syscall map after
+// exit() and exit_group() because raw_tracepoint/sys_exit is not called in
+// that case.
+SEC("tracepoint/sched/sched_process_exit")
+int ig_cap_sched_exit(void *ctx)
+{
+	u32 pid = (u32)bpf_get_current_pid_tgid();
+	bpf_map_delete_elem(&current_syscall, &pid);
 	return 0;
 }
 

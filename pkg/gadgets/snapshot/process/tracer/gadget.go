@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package tracer is deprecated.
+//
+// Deprecated: Switch to image-based gadgets instead. Check
+// https://github.com/inspektor-gadget/inspektor-gadget/tree/main/examples/gadgets
 package tracer
 
 import (
@@ -29,7 +33,9 @@ const (
 	ParamThreads = "threads"
 )
 
-type GadgetDesc struct{}
+type GadgetDesc struct {
+	gadgets.GadgetDeprecated
+}
 
 func (g *GadgetDesc) Name() string {
 	return "process"
@@ -92,7 +98,7 @@ func (g *GadgetDesc) OutputFormats() (gadgets.OutputFormats, string) {
 }
 
 func (g *GadgetDesc) SortByDefault() []string {
-	return []string{"k8s.node", "k8s.namespace", "k8s.pod", "k8s.container", "comm", "pid", "tid", "ppid"}
+	return []string{"k8s.node", "k8s.namespace", "k8s.podName", "k8s.containerName", "comm", "pid", "tid", "ppid"}
 }
 
 func init() {

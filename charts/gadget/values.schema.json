@@ -10,7 +10,8 @@
         "containerdSocketPath",
         "crioSocketPath",
         "dockerSocketPath",
-        "experimental"
+        "experimental",
+        "eventsBufferLength"
       ],
       "properties": {
         "hookMode": {
@@ -20,7 +21,6 @@
             "crio",
             "podinformer",
             "nri",
-            "fanotify",
             "fanotify+ebpf"
           ]
         },
@@ -36,8 +36,14 @@
         "dockerSocketPath": {
           "type": "string"
         },
+        "podmanSocketPath": {
+          "type": "string"
+        },
         "experimental": {
           "type": "boolean"
+        },
+        "eventsBufferLength": {
+          "type": "string"
         }
       }
     },

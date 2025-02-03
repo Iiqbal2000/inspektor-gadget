@@ -2,6 +2,7 @@ output:
   sort-results: true
 
 run:
+  go: "1.23.4"
   timeout: 10m
   build-tags:
   - docs
@@ -19,6 +20,9 @@ issues:
     - text: "ST1003:"
       linters:
         - stylecheck
+    - text: "Switch to image-based gadgets instead"
+      linters:
+        - staticcheck
 
 linters:
   disable-all: true
@@ -27,15 +31,12 @@ linters:
   - stylecheck
   - staticcheck
   - errorlint
+  - goimports
 
 linters-settings:
-  gofumpt:
-    lang-version: "1.19"
   staticcheck:
-    go: "1.19"
     checks: ["all"]
   stylecheck:
-    go: "1.19"
     checks: ["all"]
   errorlint:
     # https://github.com/polyfloyd/go-errorlint
@@ -45,3 +46,8 @@ linters-settings:
     asserts: true
     # Check for plain error comparisons (errors.Is must be used)
     comparison: true
+  goimports:
+    # A comma-separated list of prefixes, which, if set, checks import paths
+    # with the given prefixes are grouped after 3rd-party packages.
+    # Default: ""
+    local-prefixes: github.com/inspektor-gadget/inspektor-gadget

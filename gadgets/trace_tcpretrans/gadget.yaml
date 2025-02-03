@@ -1,33 +1,36 @@
-name: tcpretrans
+name: trace tcpretrans
 description: trace TCP retransmissions
-columns:
-  #- name: timestamp
-  #  template: timestamp
-  #  order: 900
-  - name: src
-    min_width: 24
-    max_width: 50
-    order: 1000
-    visible: true
-  - name: dst
-    min_width: 24
-    max_width: 50
-    order: 1001
-    visible: true
-  - name: task
-    template: comm
-    width: 16
-    order: 1002
-    visible: true
-  - name: pid
-    template: pid
-    order: 1003
-    visible: true
-  - name: uid
-    template: uid
-    order: 1004
-    visible: true
-  - name: gid
-    template: uid
-    order: 1005
-    visible: true
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_tcpretrans
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_tcpretrans
+datasources:
+  tcpretrans:
+    fields:
+      src:
+        annotations:
+          template: l4endpoint
+      dst:
+        annotations:
+          template: l4endpoint
+      tcpflags_raw:
+        annotations:
+          columns.hidden: true
+      tcpflags:
+        annotations:
+          description: TCP flags from a TCP header
+      reason_raw:
+        annotations:
+          columns.hidden: true
+      reason:
+        annotations:
+          description: Reason for retransmission
+      type_raw:
+        annotations:
+          columns.hidden: true
+      type:
+        annotations:
+          description: Type of the retransmission, either RETRANS or LOSS
+          columns.width: 10
+      state:
+        annotations:
+          description: Connection state

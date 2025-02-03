@@ -16,6 +16,7 @@ package types
 
 import (
 	"io/fs"
+	"strings"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/columns"
 	eventtypes "github.com/inspektor-gadget/inspektor-gadget/pkg/types"
@@ -26,12 +27,12 @@ type Event struct {
 	eventtypes.WithMountNsID
 
 	Pid      uint32      `json:"pid,omitempty" column:"pid,minWidth:7"`
+	Tid      uint32      `json:"tid,omitempty" column:"tid,minWidth:7"`
 	Uid      uint32      `json:"uid,omitempty" column:"uid,minWidth:10,hide"`
 	Gid      uint32      `json:"gid" column:"gid,template:gid,hide"`
 	Comm     string      `json:"comm,omitempty" column:"comm,maxWidth:16"`
-	Fd       int         `json:"fd,omitempty" column:"fd,minWidth:2,width:3"`
-	Ret      int         `json:"ret,omitempty" column:"ret,width:3,fixed,hide"`
-	Err      int         `json:"err,omitempty" column:"err,width:3,fixed"`
+	Fd       uint32      `json:"fd,omitempty" column:"fd,minWidth:2,width:3"`
+	Err      int32       `json:"err,omitempty" column:"err,width:3,fixed"`
 	Flags    []string    `json:"flags,omitempty" column:"flags,width:24,hide"`
 	FlagsRaw int32       `json:"flagsRaw,omitempty"`
 	Mode     string      `json:"mode,omitempty" column:"mode,width:10,hide"`
@@ -41,7 +42,13 @@ type Event struct {
 }
 
 func GetColumns() *columns.Columns[Event] {
-	return columns.MustCreateColumns[Event]()
+	openColumns := columns.MustCreateColumns[Event]()
+
+	openColumns.MustSetExtractor("flags", func(event *Event) any {
+		return strings.Join(event.Flags, "|")
+	})
+
+	return openColumns
 }
 
 func Base(ev eventtypes.Event) *Event {

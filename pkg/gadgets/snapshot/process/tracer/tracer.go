@@ -180,12 +180,12 @@ func getPidEvents(config *Config, enricher gadgets.DataEnricherByMntNs, pid int)
 			continue
 		}
 
-		tid64, err := strconv.ParseUint(item.Name(), 10, 32)
+		tid, err := strconv.ParseInt(item.Name(), 10, strconv.IntSize)
 		if err != nil {
 			continue
 		}
-		tid := int(tid64)
-		event, err := getTidEvent(config, enricher, pid, tid)
+
+		event, err := getTidEvent(config, enricher, pid, int(tid))
 		if err != nil {
 			continue
 		}
@@ -209,20 +209,19 @@ func runProcfsCollector(config *Config, enricher gadgets.DataEnricherByMntNs) ([
 			continue
 		}
 
-		pid64, err := strconv.ParseUint(item.Name(), 10, 32)
+		pid, err := strconv.ParseInt(item.Name(), 10, strconv.IntSize)
 		if err != nil {
 			continue
 		}
-		pid := int(pid64)
 
 		if config.ShowThreads {
-			pidEvents, err := getPidEvents(config, enricher, pid)
+			pidEvents, err := getPidEvents(config, enricher, int(pid))
 			if err != nil {
 				continue
 			}
 			events = append(events, pidEvents...)
 		} else {
-			event, err := getTidEvent(config, enricher, pid, pid)
+			event, err := getTidEvent(config, enricher, int(pid), int(pid))
 			if err != nil {
 				continue
 			}

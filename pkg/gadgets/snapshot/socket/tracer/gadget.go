@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package tracer is deprecated.
+//
+// Deprecated: Switch to image-based gadgets instead. Check
+// https://github.com/inspektor-gadget/inspektor-gadget/tree/main/examples/gadgets
 package tracer
 
 import (
@@ -30,7 +34,9 @@ const (
 	ParamExtend = "extend"
 )
 
-type GadgetDesc struct{}
+type GadgetDesc struct {
+	gadgets.GadgetDeprecated
+}
 
 func (g *GadgetDesc) Name() string {
 	return "socket"
@@ -74,7 +80,7 @@ func (g *GadgetDesc) EventPrototype() any {
 
 func (g *GadgetDesc) SortByDefault() []string {
 	return []string{
-		"k8s.node", "k8s.namespace", "k8s.pod", "protocol", "status", "src", "dst", "inode",
+		"k8s.node", "k8s.namespace", "k8s.podName", "protocol", "status", "src", "dst", "inode",
 	}
 }
 
