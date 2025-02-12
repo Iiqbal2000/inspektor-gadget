@@ -26,6 +26,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -37,27 +38,36 @@ import (
 	containerhook "github.com/inspektor-gadget/inspektor-gadget/pkg/container-hook"
 	containerutils "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/cgroups"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/cri"
 	ociannotations "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/oci-annotations"
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
 	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/runcfanotify"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
+func setIfEmptyStr[T ~string](s *T, v T) {
+	if *s == "" {
+		*s = v
+	}
+}
+
 func enrichContainerWithContainerData(containerData *runtimeclient.ContainerData, container *Container) {
 	// Runtime
-	container.Runtime.ContainerID = containerData.Runtime.ContainerID
-	container.Runtime.RuntimeName = containerData.Runtime.RuntimeName
-	container.Runtime.ContainerName = containerData.Runtime.ContainerName
-	container.Runtime.ContainerImageName = containerData.Runtime.ContainerImageName
-	container.Runtime.ContainerImageDigest = containerData.Runtime.ContainerImageDigest
+	setIfEmptyStr(&container.Runtime.ContainerID, containerData.Runtime.ContainerID)
+	setIfEmptyStr(&container.Runtime.RuntimeName, containerData.Runtime.RuntimeName)
+	setIfEmptyStr(&container.Runtime.ContainerName, containerData.Runtime.ContainerName)
+	setIfEmptyStr(&container.Runtime.ContainerImageName, containerData.Runtime.ContainerImageName)
+	setIfEmptyStr(&container.Runtime.ContainerImageDigest, containerData.Runtime.ContainerImageDigest)
 
 	// Kubernetes
-	container.K8s.Namespace = containerData.K8s.Namespace
-	container.K8s.PodName = containerData.K8s.PodName
-	container.K8s.PodUID = containerData.K8s.PodUID
-	container.K8s.ContainerName = containerData.K8s.ContainerName
+	setIfEmptyStr(&container.K8s.Namespace, containerData.K8s.Namespace)
+	setIfEmptyStr(&container.K8s.PodName, containerData.K8s.PodName)
+	setIfEmptyStr(&container.K8s.PodUID, containerData.K8s.PodUID)
+	setIfEmptyStr(&container.K8s.ContainerName, containerData.K8s.ContainerName)
+	if container.K8s.PodLabels == nil {
+		container.K8s.PodLabels = containerData.K8s.PodLabels
+	}
 }
 
 func containerRuntimeEnricher(
@@ -65,10 +75,31 @@ func containerRuntimeEnricher(
 	runtimeClient runtimeclient.ContainerRuntimeClient,
 	container *Container,
 ) bool {
-	// If the container is already enriched with the metadata a runtime client
-	// is able to provide, skip it.
+	// If the container is already enriched with all the metadata a runtime
+	// client is able to provide, skip it.
 	if runtimeclient.IsEnrichedWithK8sMetadata(container.K8s.BasicK8sMetadata) &&
 		runtimeclient.IsEnrichedWithRuntimeMetadata(container.Runtime.BasicRuntimeMetadata) {
+		return true
+	}
+
+	// For new CRI-O containers, the next GetContainer() call will always fail
+	// because the container doesn't exist yet. So, if we have the sandbox ID,
+	// let's enrich the container at least with the PodLabels as the PodSandbox
+	// do exist at this point.
+	if container.Runtime.RuntimeName == types.RuntimeNameCrio {
+		criClient, ok := runtimeClient.(*cri.CRIClient)
+		if ok && container.SandboxId != "" {
+			labels, err := criClient.GetPodLabels(container.SandboxId)
+			if err != nil {
+				log.Warnf("Runtime enricher (%s): failed to GetPodLabels: %s",
+					runtimeName, err)
+
+				// We couldn't get the labels, but don't drop the container.
+				return true
+			}
+			container.K8s.PodLabels = labels
+		}
+
 		return true
 	}
 
@@ -195,7 +226,7 @@ func WithContainerRuntimeEnrichment(runtime *containerutilsTypes.RuntimeConfig) 
 			}
 
 			var c Container
-			c.Pid = uint32(pid)
+			c.Runtime.ContainerPID = uint32(pid)
 			enrichContainerWithContainerData(&containerDetails.ContainerData, &c)
 			cc.initialContainers = append(cc.initialContainers, &c)
 		}
@@ -318,7 +349,7 @@ func WithHost() ContainerCollectionOption {
 		newContainer := Container{}
 		newContainer.K8s.ContainerName = "host"
 		newContainer.CgroupID = 1
-		newContainer.Pid = 1
+		newContainer.Runtime.ContainerPID = 1
 		newContainer.HostNetwork = true
 		cc.initialContainers = append(cc.initialContainers, &newContainer)
 		return nil
@@ -437,6 +468,35 @@ func getOwnerReferences(dynamicClient dynamic.Interface,
 	return res.GetOwnerReferences(), nil
 }
 
+func getPodByCgroups(clientset *kubernetes.Clientset, nodeName string, container *Container) (*corev1.Pod, error) {
+	if container.CgroupV1 == "" && container.CgroupV2 == "" {
+		return nil, fmt.Errorf("need cgroup paths to work")
+	}
+
+	fieldSelector := fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
+	pods, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
+		FieldSelector: fieldSelector,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetching pods: %w", err)
+	}
+
+	for _, pod := range pods.Items {
+		uid := string(pod.ObjectMeta.UID)
+		// check if this container is associated to this pod
+		uidWithUnderscores := strings.ReplaceAll(uid, "-", "_")
+
+		if !strings.Contains(container.CgroupV2, uidWithUnderscores) &&
+			!strings.Contains(container.CgroupV2, uid) &&
+			!strings.Contains(container.CgroupV1, uidWithUnderscores) &&
+			!strings.Contains(container.CgroupV1, uid) {
+			continue
+		}
+		return &pod, nil
+	}
+	return nil, fmt.Errorf("no pod found for container %q", container.Runtime.ContainerName)
+}
+
 // WithKubernetesEnrichment automatically adds pod metadata
 //
 // ContainerCollection.Initialize(WithKubernetesEnrichment())
@@ -456,130 +516,68 @@ func WithKubernetesEnrichment(nodeName string, kubeconfig *rest.Config) Containe
 
 		// Future containers
 		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
-			if container.K8s.PodName != "" {
-				return true
-			}
-
-			if container.CgroupV1 == "" && container.CgroupV2 == "" {
-				log.Errorf("kubernetes enricher: cannot work without cgroup paths")
-				return true
-			}
-
-			fieldSelector := fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
-			pods, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
-				FieldSelector: fieldSelector,
-			})
-			if err != nil {
-				log.Errorf("kubernetes enricher: cannot fetch pods: %s", err)
-				return true
-			}
-
-			// Fill Kubernetes fields
-			namespace := ""
-			podname := ""
-			podUID := ""
-			containerName := ""
-			labels := make(map[string]string)
-			for _, pod := range pods.Items {
-				uid := string(pod.ObjectMeta.UID)
-				// check if this container is associated to this pod
-				uidWithUnderscores := strings.ReplaceAll(uid, "-", "_")
-
-				if !strings.Contains(container.CgroupV2, uidWithUnderscores) &&
-					!strings.Contains(container.CgroupV2, uid) &&
-					!strings.Contains(container.CgroupV1, uidWithUnderscores) &&
-					!strings.Contains(container.CgroupV1, uid) {
-					continue
-				}
-
-				namespace = pod.ObjectMeta.Namespace
-				podname = pod.ObjectMeta.Name
-				podUID = uid
-
-				for k, v := range pod.ObjectMeta.Labels {
-					labels[k] = v
-				}
-
-				containerNames := []string{}
-				for _, c := range pod.Spec.Containers {
-					containerNames = append(containerNames, c.Name)
-				}
-				for _, c := range pod.Spec.InitContainers {
-					containerNames = append(containerNames, c.Name)
-				}
-				for _, c := range pod.Spec.EphemeralContainers {
-					containerNames = append(containerNames, c.Name)
-				}
-			outerLoop:
-				for _, name := range containerNames {
-					for _, m := range container.OciConfig.Mounts {
-						pattern := fmt.Sprintf("pods/%s/containers/%s/", uid, name)
-						if strings.Contains(m.Source, pattern) {
-							containerName = name
-							break outerLoop
-						}
+			// Skip enriching if basic k8s fields are already known.
+			// This is an optimization and to make sure to avoid erasing the fields in case of error.
+			if !runtimeclient.IsEnrichedWithK8sMetadata(container.K8s.BasicK8sMetadata) {
+				var pod *corev1.Pod
+				var err error
+				if container.K8s.PodName == "" || container.K8s.Namespace == "" {
+					pod, err = getPodByCgroups(clientset, nodeName, container)
+					if err != nil {
+						log.Errorf("kubernetes enricher (from UID): cannot find pod for container %s: %s", container.Runtime.ContainerName, err)
+						return false
+					}
+				} else {
+					pod, err = clientset.CoreV1().Pods(container.K8s.Namespace).Get(context.TODO(), container.K8s.PodName, metav1.GetOptions{})
+					if err != nil {
+						log.Errorf("kubernetes enricher (from ns/podname): cannot find pod %s/%s: %s", container.K8s.Namespace, container.K8s.PodName, err)
+						return false
 					}
 				}
-			}
 
-			container.K8s.Namespace = namespace
-			container.K8s.PodName = podname
-			container.K8s.PodUID = podUID
-			container.K8s.ContainerName = containerName
-			container.K8s.PodLabels = labels
-
-			// drop pause containers
-			if container.K8s.PodName != "" && containerName == "" {
-				return false
-			}
-
-			return true
-		})
-		return nil
-	}
-}
-
-// WithRuncFanotify uses fanotify to detect when containers are created and add
-// them in the ContainerCollection.
-//
-// This requires execution in the host pid namespace. For this reason, it is
-// preferable to use WithContainerFanotifyEbpf() instead.
-//
-// ContainerCollection.Initialize(WithRuncFanotify())
-func WithRuncFanotify() ContainerCollectionOption {
-	return func(cc *ContainerCollection) error {
-		runcNotifier, err := runcfanotify.NewRuncNotifier(func(notif runcfanotify.ContainerEvent) {
-			switch notif.Type {
-			case runcfanotify.EventTypeAddContainer:
-				container := &Container{
-					Runtime: RuntimeMetadata{
-						BasicRuntimeMetadata: types.BasicRuntimeMetadata{
-							ContainerID:   notif.ContainerID,
-							ContainerName: notif.ContainerName,
-						},
-					},
-					Pid:       notif.ContainerPID,
-					OciConfig: notif.ContainerConfig,
+				if container.K8s.ContainerName == "" {
+					var containerName string
+					uid := string(pod.ObjectMeta.UID)
+					containerNames := []string{}
+					for _, c := range pod.Spec.Containers {
+						containerNames = append(containerNames, c.Name)
+					}
+					for _, c := range pod.Spec.InitContainers {
+						containerNames = append(containerNames, c.Name)
+					}
+					for _, c := range pod.Spec.EphemeralContainers {
+						containerNames = append(containerNames, c.Name)
+					}
+				outerLoop:
+					for _, name := range containerNames {
+						for _, m := range container.OciConfig.Mounts {
+							pattern := fmt.Sprintf("pods/%s/containers/%s/", uid, name)
+							if strings.Contains(m.Source, pattern) {
+								containerName = name
+								break outerLoop
+							}
+						}
+					}
+					container.K8s.ContainerName = containerName
 				}
-				cc.AddContainer(container)
-			case runcfanotify.EventTypeRemoveContainer:
-				cc.RemoveContainer(notif.ContainerID)
+
+				container.K8s.Namespace = pod.ObjectMeta.Namespace
+				container.K8s.PodName = pod.ObjectMeta.Name
+				container.K8s.PodUID = string(pod.ObjectMeta.UID)
+				container.K8s.PodLabels = pod.ObjectMeta.Labels
+
+				// drop pause containers
+				if container.K8s.PodName != "" && container.K8s.ContainerName == "" {
+					return false
+				}
 			}
-		})
-		if err != nil {
-			return fmt.Errorf("starting runc fanotify: %w", err)
-		}
 
-		cc.cleanUpFuncs = append(cc.cleanUpFuncs, func() {
-			runcNotifier.Close()
-		})
-
-		// Future containers
-		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
-			err := runcNotifier.AddWatchContainerTermination(container.Runtime.ContainerID, int(container.Pid))
-			if err != nil {
-				log.Errorf("runc fanotify enricher: failed to watch container %s: %s", container.Runtime.ContainerID, err)
-				return false
+			if container.K8s.ownerReference == nil {
+				_, err = container.GetOwnerReference()
+				if err != nil {
+					log.Errorf("kubernetes enricher: failed to get owner reference for container %s: %s", container.Runtime.ContainerID, err)
+					// Don't drop the container. We just have problems getting the owner reference, but still want to trace the container.
+				}
 			}
 			return true
 		})
@@ -602,10 +600,10 @@ func WithContainerFanotifyEbpf() ContainerCollectionOption {
 					Runtime: RuntimeMetadata{
 						BasicRuntimeMetadata: types.BasicRuntimeMetadata{
 							ContainerID:   notif.ContainerID,
+							ContainerPID:  notif.ContainerPID,
 							ContainerName: notif.ContainerName,
 						},
 					},
-					Pid:       notif.ContainerPID,
 					OciConfig: notif.ContainerConfig,
 				}
 				cc.AddContainer(container)
@@ -623,7 +621,7 @@ func WithContainerFanotifyEbpf() ContainerCollectionOption {
 
 		// Future containers
 		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
-			err := containerNotifier.AddWatchContainerTermination(container.Runtime.ContainerID, int(container.Pid))
+			err := containerNotifier.AddWatchContainerTermination(container.Runtime.ContainerID, int(container.ContainerPid()))
 			if err != nil {
 				log.Errorf("container fanotify enricher: failed to watch container %s: %s", container.Runtime.ContainerID, err)
 				return false
@@ -638,7 +636,7 @@ func WithContainerFanotifyEbpf() ContainerCollectionOption {
 func WithCgroupEnrichment() ContainerCollectionOption {
 	return func(cc *ContainerCollection) error {
 		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
-			pid := int(container.Pid)
+			pid := int(container.ContainerPid())
 			if pid == 0 {
 				log.Errorf("cgroup enricher: failed to enrich container %s with pid zero", container.Runtime.ContainerID)
 				return true
@@ -673,7 +671,7 @@ func WithLinuxNamespaceEnrichment() ContainerCollectionOption {
 		}
 
 		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
-			pid := int(container.Pid)
+			pid := int(container.ContainerPid())
 			if pid == 0 {
 				log.Errorf("namespace enricher: failed to enrich container %s with pid zero", container.Runtime.ContainerID)
 				return true
@@ -709,7 +707,8 @@ func isEnrichedWithOCIConfigInfo(container *Container) bool {
 		container.K8s.ContainerName != "" &&
 		container.K8s.PodName != "" &&
 		container.K8s.Namespace != "" &&
-		container.K8s.PodUID != ""
+		container.K8s.PodUID != "" &&
+		container.SandboxId != ""
 }
 
 // WithOCIConfigEnrichment enriches container using provided OCI config
@@ -753,6 +752,9 @@ func WithOCIConfigEnrichment() ContainerCollectionOption {
 			}
 			if imageName := resolver.ContainerImageName(container.OciConfig.Annotations); imageName != "" {
 				container.Runtime.ContainerImageName = imageName
+			}
+			if podSandboxId := resolver.PodSandboxId(container.OciConfig.Annotations); podSandboxId != "" {
+				container.SandboxId = podSandboxId
 			}
 
 			return true
@@ -819,7 +821,7 @@ func WithTracerCollection(tc TracerCollection) ContainerCollectionOption {
 		}()
 
 		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
-			mntNsPath := filepath.Join(host.HostProcFs, fmt.Sprint(container.Pid), "ns", "mnt")
+			mntNsPath := filepath.Join(host.HostProcFs, fmt.Sprint(container.ContainerPid()), "ns", "mnt")
 			mntNsFd, err := unix.Open(mntNsPath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 			if err != nil {
 				log.Warnf("WithTracerCollection: failed to open mntns reference for container %s: %s",
@@ -831,7 +833,7 @@ func WithTracerCollection(tc TracerCollection) ContainerCollectionOption {
 			}
 			container.mntNsFd = mntNsFd
 
-			netNsPath := filepath.Join(host.HostProcFs, fmt.Sprint(container.Pid), "ns", "net")
+			netNsPath := filepath.Join(host.HostProcFs, fmt.Sprint(container.ContainerPid()), "ns", "net")
 			netNsFd, err := unix.Open(netNsPath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 			if err != nil {
 				log.Warnf("WithTracerCollection: failed to open netns reference for container %s: %s",
@@ -861,6 +863,29 @@ func WithTracerCollection(tc TracerCollection) ContainerCollectionOption {
 
 		cc.pubsub.Subscribe("tracercollection", tc.TracerMapsUpdater(), nil)
 
+		return nil
+	}
+}
+
+// WithProcEnrichment enables an enricher to add process metadata
+func WithProcEnrichment() ContainerCollectionOption {
+	return func(cc *ContainerCollection) error {
+		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
+			pid := int(container.ContainerPid())
+			if pid == 0 {
+				log.Errorf("proc enricher: failed to enrich container %s with pid zero", container.Runtime.ContainerID)
+				return false
+			}
+
+			procStat, err := host.GetProcStat(pid)
+			if err != nil {
+				log.Errorf("proc enricher: failed to read /proc/%d/stat for container %s: %v", pid, container.Runtime.ContainerID, err)
+				return false
+			}
+
+			container.Runtime.ContainerStartedAt = procStat.StartedAt
+			return true
+		})
 		return nil
 	}
 }

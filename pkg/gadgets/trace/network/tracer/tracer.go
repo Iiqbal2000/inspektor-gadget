@@ -1,4 +1,4 @@
-// Copyright 2019-2023 The Inspektor Gadget authors
+// Copyright 2019-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,8 +26,8 @@ import (
 
 	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/internal/networktracer"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/trace/network/types"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/networktracer"
 	eventtypes "github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
 
@@ -49,6 +49,17 @@ func NewTracer() (_ *Tracer, err error) {
 	}
 
 	return t, nil
+}
+
+// RunWorkaround is used by pkg/gadget-collection/gadgets/trace/network/gadget.go to run the gadget
+// after calling NewTracer(). Get rid of it once that file is removed.
+func (t *Tracer) RunWorkaround() error {
+	if err := t.run(); err != nil {
+		t.Close()
+		return fmt.Errorf("running tracer: %w", err)
+	}
+
+	return nil
 }
 
 func pktTypeString(pktType int) string {
@@ -124,24 +135,34 @@ func (t *Tracer) Init(gadgetCtx gadgets.GadgetContext) error {
 }
 
 func (t *Tracer) install() error {
+	networkTracer, err := networktracer.NewTracer[types.Event]()
+	if err != nil {
+		return fmt.Errorf("creating network tracer: %w", err)
+	}
+
+	t.Tracer = networkTracer
+	return nil
+}
+
+func (t *Tracer) run() error {
 	spec, err := loadNetwork()
 	if err != nil {
 		return fmt.Errorf("loading asset: %w", err)
 	}
 
-	networkTracer, err := networktracer.NewTracer[types.Event]()
-	if err != nil {
-		return fmt.Errorf("creating network tracer: %w", err)
-	}
-	err = networkTracer.Run(spec, types.Base, parseNetEvent)
+	err = t.Tracer.Run(spec, types.Base, parseNetEvent)
 	if err != nil {
 		return fmt.Errorf("setting network tracer spec: %w", err)
 	}
-	t.Tracer = networkTracer
+
 	return nil
 }
 
 func (t *Tracer) Run(gadgetCtx gadgets.GadgetContext) error {
+	if err := t.run(); err != nil {
+		return err
+	}
+
 	<-t.ctx.Done()
 	return nil
 }

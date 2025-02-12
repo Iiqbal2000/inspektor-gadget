@@ -57,18 +57,6 @@ type ContainerdContainer struct {
 	exitStatus <-chan containerd.ExitStatus
 }
 
-func (c *ContainerdContainer) Running() bool {
-	return c.started
-}
-
-func (c *ContainerdContainer) ID() string {
-	return c.id
-}
-
-func (c *ContainerdContainer) Pid() int {
-	return c.pid
-}
-
 func (c *ContainerdContainer) initClientAndCtx() error {
 	var err error
 	c.client, err = containerd.New("/run/containerd/containerd.sock",
@@ -116,8 +104,20 @@ func (c *ContainerdContainer) Run(t *testing.T) {
 	if len(c.cmd) != 0 {
 		specOpts = append(specOpts, oci.WithProcessArgs("/bin/sh", "-c", c.cmd))
 	}
+	if c.options.privileged {
+		specOpts = append(specOpts, oci.WithPrivileged)
+	}
 	if c.options.seccompProfile != "" {
 		t.Fatalf("testutils/containerd: seccomp profiles are not supported yet")
+	}
+	if c.options.portBindings != nil {
+		t.Fatalf("testutils/containerd: Port bindings are not supported yet")
+	}
+	if len(c.options.mounts) > 0 {
+		t.Fatalf("testutils/containerd: Mounts are not supported yet")
+	}
+	if c.options.expectStartError {
+		t.Fatalf("testutils/containerd: ExpectStartError is not supported yet")
 	}
 
 	var spec specs.Spec

@@ -15,68 +15,85 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
-	"strings"
+	"os"
 
-	"github.com/blang/semver"
 	"github.com/spf13/cobra"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/inspektor-gadget/inspektor-gadget/cmd/common"
-	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/utils"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/k8sutil"
+	"github.com/inspektor-gadget/inspektor-gadget/internal/version"
+	grpcruntime "github.com/inspektor-gadget/inspektor-gadget/pkg/runtime/grpc"
 )
 
-func init() {
-	rootCmd.AddCommand(versionCmd)
+// VersionInfo represents the structure for version information output
+type VersionInfo struct {
+	ClientVersion *Version `json:"clientVersion,omitempty"`
+	ServerVersion *Version `json:"serverVersion,omitempty"`
+}
 
-	utils.KubectlGadgetVersion, _ = semver.New(common.Version()[1:])
+// Version contains detailed version information
+type Version struct {
+	Version string `json:"version"`
+}
+
+var outputFormat string
+
+func init() {
+	versionCmd.Flags().StringVarP(&outputFormat, "output", "o", "", "Output format. One of: json|''")
+	rootCmd.AddCommand(versionCmd)
 }
 
 var versionCmd = &cobra.Command{
-	Use:   "version",
-	Short: "Show version",
+	Use:          "version",
+	Short:        "Show version",
+	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Println("Client version:", common.Version())
+		// Initialize version info structure
+		versionInfo := &VersionInfo{
+			ClientVersion: &Version{
+				Version: version.Version().String(),
+			},
+		}
 
-		client, err := k8sutil.NewClientsetFromConfigFlags(utils.KubernetesConfigFlags)
+		// Get server version information
+		gadgetNamespaces, err := utils.GetRunningGadgetNamespaces()
 		if err != nil {
-			return commonutils.WrapInErrSetupK8sClient(err)
+			fmt.Fprintf(os.Stderr, "Error: getting running Inspektor Gadget instances: %s\n", err)
 		}
 
-		opts := metav1.ListOptions{LabelSelector: "k8s-app=gadget"}
-		pods, err := client.CoreV1().Pods("gadget").List(context.TODO(), opts)
-		if err != nil {
-			return commonutils.WrapInErrListPods(err)
+		if len(gadgetNamespaces) == 1 {
+			// Exactly one running gadget instance found, use it
+			runtimeGlobalParams.Set(grpcruntime.ParamGadgetNamespace, gadgetNamespaces[0])
+			info, err := grpcRuntime.InitDeployInfo()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: loading deploy info: %s\n", err)
+			} else {
+				versionInfo.ServerVersion = &Version{
+					Version: info.ServerVersion,
+				}
+			}
+		} else if len(gadgetNamespaces) > 1 {
+			fmt.Fprintf(os.Stderr, "Error: multiple Inspektor Gadget instances found in namespaces: %s\n", gadgetNamespaces)
 		}
 
-		serverVersions := make(map[string]struct{})
-		for _, pod := range pods.Items {
-			image := pod.Spec.Containers[0].Image
-
-			// Get the image tag
-			parts := strings.Split(image, ":")
-			if len(parts) < 2 {
-				continue
+		// Output based on format
+		switch outputFormat {
+		case "json":
+			output, err := json.MarshalIndent(versionInfo, "", "  ")
+			if err != nil {
+				return fmt.Errorf("marshaling version info: %w", err)
 			}
-
-			versionStr := parts[len(parts)-1]
-			if _, ok := serverVersions[versionStr]; !ok {
-				serverVersions[versionStr] = struct{}{}
+			fmt.Println(string(output))
+		case "":
+			fmt.Printf("Client version: v%s\n", versionInfo.ClientVersion.Version)
+			if versionInfo.ServerVersion != nil && versionInfo.ServerVersion.Version != "" {
+				fmt.Printf("Server version: v%s\n", versionInfo.ServerVersion.Version)
+			} else {
+				fmt.Println("Server version: not available")
 			}
-		}
-
-		if len(serverVersions) == 0 {
-			fmt.Println("Server version:", "not installed")
-		} else {
-			if len(serverVersions) > 1 {
-				fmt.Println("Warning: Multiple deployed versions detected")
-			}
-			for version := range serverVersions {
-				fmt.Println("Server version:", version)
-			}
+		default:
+			return fmt.Errorf("invalid output format: %s", outputFormat)
 		}
 
 		return nil

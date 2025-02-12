@@ -1,4 +1,4 @@
-// Copyright 2022-2023 The Inspektor Gadget authors
+// Copyright 2022-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 package local
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -25,7 +24,6 @@ import (
 
 	gadgetregistry "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-registry"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
-	runTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/run/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/runtime"
@@ -82,15 +80,7 @@ func (r *Runtime) ParamDescs() params.ParamDescs {
 	return nil
 }
 
-func (r *Runtime) GetGadgetInfo(_ context.Context, desc gadgets.GadgetDesc, pars *params.Params, args []string) (*runTypes.GadgetInfo, error) {
-	runDesc, ok := desc.(runTypes.RunGadgetDesc)
-	if !ok {
-		return nil, fmt.Errorf("GetGadgetInfo not supported for gadget %s", desc.Name())
-	}
-	return runDesc.GetGadgetInfo(pars, args)
-}
-
-func (r *Runtime) RunGadget(gadgetCtx runtime.GadgetContext) (runtime.CombinedGadgetResult, error) {
+func (r *Runtime) RunBuiltInGadget(gadgetCtx runtime.GadgetContext) (runtime.CombinedGadgetResult, error) {
 	log := gadgetCtx.Logger()
 
 	log.Debugf("running with local runtime")
@@ -131,22 +121,25 @@ func (r *Runtime) RunGadget(gadgetCtx runtime.GadgetContext) (runtime.CombinedGa
 		log.Debugf("  %s", operator.Name())
 	}
 
-	// Set event handler
-	if setter, ok := gadgetInstance.(gadgets.EventHandlerSetter); ok {
-		log.Debugf("set event handler")
-		setter.SetEventHandler(gadgetCtx.Parser().EventHandlerFunc(operatorInstances.Enrich))
-	}
+	parser := gadgetCtx.Parser()
+	if parser != nil {
+		// Set event handler
+		if setter, ok := gadgetInstance.(gadgets.EventHandlerSetter); ok {
+			log.Debugf("set event handler")
+			setter.SetEventHandler(parser.EventHandlerFunc(operatorInstances.Enrich))
+		}
 
-	// Set event handler for array results
-	if setter, ok := gadgetInstance.(gadgets.EventHandlerArraySetter); ok {
-		log.Debugf("set event handler for arrays")
-		setter.SetEventHandlerArray(gadgetCtx.Parser().EventHandlerFuncArray(operatorInstances.Enrich))
-	}
+		// Set event handler for array results
+		if setter, ok := gadgetInstance.(gadgets.EventHandlerArraySetter); ok {
+			log.Debugf("set event handler for arrays")
+			setter.SetEventHandlerArray(parser.EventHandlerFuncArray(operatorInstances.Enrich))
+		}
 
-	// Set event enricher (currently only used by profile/cpu)
-	if setter, ok := gadgetInstance.(gadgets.EventEnricherSetter); ok {
-		log.Debugf("set event enricher")
-		setter.SetEventEnricher(operatorInstances.Enrich)
+		// Set event enricher (currently only used by profile/cpu)
+		if setter, ok := gadgetInstance.(gadgets.EventEnricherSetter); ok {
+			log.Debugf("set event enricher")
+			setter.SetEventEnricher(operatorInstances.Enrich)
+		}
 	}
 
 	log.Debug("calling operator.PreGadgetRun()")

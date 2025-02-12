@@ -1,0 +1,41 @@
+name: trace tcp
+description: monitor connect, accept and close events of TCP connections
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_tcp
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_tcp
+datasources:
+  tracetcp:
+    fields:
+      src:
+        annotations:
+          template: l4endpoint
+      dst:
+        annotations:
+          template: l4endpoint
+      type_raw:
+        annotations:
+          columns.hidden: true
+      type:
+        annotations:
+          description: Type of TCP connection event (connect, accept, close)
+      error_raw:
+        annotations:
+          columns.hidden: true
+      fd:
+        annotations:
+          description: The FD where the operation happened on (connect, accept)
+          columns.hidden: true
+      accept_fd:
+        annotations:
+          description: The FD of the new connection returned by accept, or -1 for errors cases or other events
+          columns.hidden: true
+params:
+  ebpf:
+    connect_only:
+      key: connect-only
+      defaultValue: "false"
+      description: Show only connect events
+    failure_only:
+      key: failure-only
+      defaultValue: "false"
+      description: Don't show successful events

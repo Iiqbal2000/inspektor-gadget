@@ -20,14 +20,10 @@ import (
 	"strings"
 	"time"
 
-	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
-	"github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/utils"
-	"github.com/inspektor-gadget/inspektor-gadget/internal/deployinfo"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/k8sutil"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -36,7 +32,14 @@ import (
 	"k8s.io/client-go/tools/cache"
 	watchtools "k8s.io/client-go/tools/watch"
 
-	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+
+	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
+	"github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/utils"
+	"github.com/inspektor-gadget/inspektor-gadget/internal/deployinfo"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/k8sutil"
+	grpcruntime "github.com/inspektor-gadget/inspektor-gadget/pkg/runtime/grpc"
 )
 
 var undeployCmd = &cobra.Command{
@@ -51,6 +54,12 @@ var undeployWait bool
 const (
 	timeout int = 30
 )
+
+var clusterImagePolicyResource = schema.GroupVersionResource{
+	Group:    "policy.sigstore.dev",
+	Version:  "v1beta1",
+	Resource: "clusterimagepolicies",
+}
 
 func init() {
 	rootCmd.AddCommand(undeployCmd)
@@ -83,6 +92,11 @@ func runUndeploy(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("setting up CRD client: %w", err)
 	}
 
+	dynClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("setting up dynamic client: %w", err)
+	}
+
 	errs := []string{}
 
 	// 1. remove traces
@@ -97,9 +111,12 @@ func runUndeploy(cmd *cobra.Command, args []string) error {
 	i := 0
 	n := 7
 
+	gadgetNamespace := runtimeGlobalParams.Get(grpcruntime.ParamGadgetNamespace).AsString()
+	imagePolicyName := fmt.Sprintf("%s-image-policy", gadgetNamespace)
+
 again:
 	fmt.Println("Removing traces...")
-	err = traceClient.GadgetV1alpha1().Traces(utils.GadgetNamespace).DeleteCollection(
+	err = traceClient.GadgetV1alpha1().Traces(gadgetNamespace).DeleteCollection(
 		context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{},
 	)
 	if err != nil && !errors.IsNotFound(err) {
@@ -108,7 +125,7 @@ again:
 
 	time.Sleep(time.Duration(delay) * time.Millisecond)
 
-	traces, err := traceClient.GadgetV1alpha1().Traces(utils.GadgetNamespace).List(
+	traces, err := traceClient.GadgetV1alpha1().Traces(gadgetNamespace).List(
 		context.TODO(), metav1.ListOptions{},
 	)
 	if err == nil && len(traces.Items) != 0 {
@@ -122,7 +139,7 @@ again:
 		// finalizers and let k8s remove them immediately.
 		for _, trace := range traces.Items {
 			data := []byte("{\"metadata\":{\"finalizers\":[]}}")
-			_, err := traceClient.GadgetV1alpha1().Traces(utils.GadgetNamespace).Patch(
+			_, err := traceClient.GadgetV1alpha1().Traces(gadgetNamespace).Patch(
 				context.TODO(), trace.Name, types.MergePatchType, data, metav1.PatchOptions{},
 			)
 			if err != nil {
@@ -192,32 +209,33 @@ again:
 	if undeployWait {
 		list, err = k8sClient.CoreV1().Namespaces().List(
 			context.TODO(), metav1.ListOptions{
-				FieldSelector: "metadata.name=" + utils.GadgetNamespace,
+				FieldSelector: "metadata.name=" + gadgetNamespace,
 			},
 		)
 		if err != nil {
-			errs = append(errs, fmt.Sprintf("failed to list %q namespace: %s", utils.GadgetNamespace, err))
+			errs = append(errs, fmt.Sprintf("failed to list %q namespace: %s", gadgetNamespace, err))
 			goto out
 		}
 
 		// nothing to do, namespace doesn't exist
 		if list == nil || len(list.Items) == 0 {
+			fmt.Printf("Nothing to do, %q namespace doesn't exist\n", gadgetNamespace)
 			goto out
 		}
 	}
 
 	fmt.Println("Removing namespace...")
 	err = k8sClient.CoreV1().Namespaces().Delete(
-		context.TODO(), utils.GadgetNamespace, metav1.DeleteOptions{},
+		context.TODO(), gadgetNamespace, metav1.DeleteOptions{},
 	)
 	if err != nil {
-		errs = append(errs, fmt.Sprintf("failed to remove %q namespace: %s", utils.GadgetNamespace, err))
+		errs = append(errs, fmt.Sprintf("failed to remove %q namespace: %s", gadgetNamespace, err))
 		goto out
 	}
 
 	if undeployWait {
 		watcher := cache.NewListWatchFromClient(
-			k8sClient.CoreV1().RESTClient(), "namespaces", "", fields.OneTermEqualSelector("metadata.name", utils.GadgetNamespace),
+			k8sClient.CoreV1().RESTClient(), "namespaces", "", fields.OneTermEqualSelector("metadata.name", gadgetNamespace),
 		)
 
 		conditionFunc := func(event watch.Event) (bool, error) {
@@ -237,7 +255,17 @@ again:
 		defer cancel()
 		_, err := watchtools.Until(ctx, list.ResourceVersion, watcher, conditionFunc)
 		if err != nil {
-			errs = append(errs, fmt.Sprintf("failed waiting for %q namespace to be removed: %s", utils.GadgetNamespace, err))
+			errs = append(errs, fmt.Sprintf("failed waiting for %q namespace to be removed: %s", gadgetNamespace, err))
+		}
+	}
+
+	// 6. delete associated image policy if present
+	_, err = dynClient.Resource(clusterImagePolicyResource).Get(context.TODO(), imagePolicyName, metav1.GetOptions{})
+	if err == nil {
+		fmt.Println("Removing image policy...")
+		err = dynClient.Resource(clusterImagePolicyResource).Delete(context.TODO(), imagePolicyName, metav1.DeleteOptions{})
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("failed removing image policy: %v", err))
 		}
 	}
 

@@ -15,18 +15,18 @@
 package integration
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/json"
+	"fmt"
 	"os/exec"
-	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/docker/go-connections/nat"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/require"
 
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/testutils"
 	eventtypes "github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
 
@@ -34,123 +34,6 @@ var cmpIgnoreUnexported = cmpopts.IgnoreUnexported(
 	containercollection.Container{},
 	containercollection.K8sMetadata{},
 )
-
-func parseMultiJSONOutput[T any](t *testing.T, output string, normalize func(*T)) []*T {
-	ret := []*T{}
-
-	decoder := json.NewDecoder(strings.NewReader(output))
-	for decoder.More() {
-		var entry T
-		if err := decoder.Decode(&entry); err != nil {
-			require.NoError(t, err, "decoding json")
-		}
-		// To be able to use reflect.DeepEqual and cmp.Diff, we need to
-		// "normalize" the output so that it only includes non-default values
-		// for the fields we are able to verify.
-		if normalize != nil {
-			normalize(&entry)
-		}
-
-		ret = append(ret, &entry)
-	}
-
-	return ret
-}
-
-func parseJSONArrayOutput[T any](t *testing.T, output string, normalize func(*T)) []*T {
-	entries := []*T{}
-
-	err := json.Unmarshal([]byte(output), &entries)
-	require.NoError(t, err, "unmarshaling output array")
-
-	for _, entry := range entries {
-		// To be able to use reflect.DeepEqual and cmp.Diff, we need to
-		// "normalize" the output so that it only includes non-default values
-		// for the fields we are able to verify.
-		if normalize != nil {
-			normalize(entry)
-		}
-	}
-
-	return entries
-}
-
-func parseMultipleJSONArrayOutput[T any](t *testing.T, output string, normalize func(*T)) []*T {
-	allEntries := make([]*T, 0)
-
-	sc := bufio.NewScanner(strings.NewReader(output))
-	// On ARO we saw arrays with charcounts of > 100,000. Lets just set 1 MB as the limit
-	sc.Buffer(make([]byte, 1024), 1024*1024)
-	for sc.Scan() {
-		entries := parseJSONArrayOutput(t, sc.Text(), normalize)
-		allEntries = append(allEntries, entries...)
-	}
-	require.NoError(t, sc.Err(), "parsing multiple JSON arrays")
-
-	return allEntries
-}
-
-func expectAllToMatch[T any](t *testing.T, entries []*T, expectedEntry *T) {
-	require.NotEmpty(t, entries, "no output entries to match")
-
-	for _, entry := range entries {
-		require.Equal(t, expectedEntry, entry, "unexpected output entry")
-	}
-}
-
-// ExpectAllToMatch verifies that the expectedEntry is matched by all the
-// entries in the output (Lines of independent JSON objects).
-func ExpectAllToMatch[T any](t *testing.T, output string, normalize func(*T), expectedEntry *T) {
-	entries := parseMultiJSONOutput(t, output, normalize)
-	expectAllToMatch(t, entries, expectedEntry)
-}
-
-// ExpectAllInArrayToMatch verifies that the expectedEntry is matched by all the
-// entries in the output (JSON array of JSON objects).
-func ExpectAllInArrayToMatch[T any](t *testing.T, output string, normalize func(*T), expectedEntry *T) {
-	entries := parseJSONArrayOutput(t, output, normalize)
-	expectAllToMatch(t, entries, expectedEntry)
-}
-
-// ExpectAllInMultipleArrayToMatch verifies that the expectedEntry is matched by all the
-// entries in the output (multiple JSON array of JSON objects separated by newlines).
-func ExpectAllInMultipleArrayToMatch[T any](t *testing.T, output string, normalize func(*T), expectedEntry *T) {
-	entries := parseMultipleJSONArrayOutput(t, output, normalize)
-	expectAllToMatch(t, entries, expectedEntry)
-}
-
-func expectEntriesToMatch[T any](t *testing.T, entries []*T, expectedEntries ...*T) {
-out:
-	for _, expectedEntry := range expectedEntries {
-		for _, entry := range entries {
-			if reflect.DeepEqual(expectedEntry, entry) {
-				continue out
-			}
-		}
-		t.Fatalf("output doesn't contain the expected entry: %+v", expectedEntry)
-	}
-}
-
-// ExpectEntriesToMatch verifies that all the entries in expectedEntries are
-// matched by at least one entry in the output (Lines of independent JSON objects).
-func ExpectEntriesToMatch[T any](t *testing.T, output string, normalize func(*T), expectedEntries ...*T) {
-	entries := parseMultiJSONOutput(t, output, normalize)
-	expectEntriesToMatch(t, entries, expectedEntries...)
-}
-
-// ExpectEntriesInArrayToMatch verifies that all the entries in expectedEntries are
-// matched by at least one entry in the output (JSON array of JSON objects).
-func ExpectEntriesInArrayToMatch[T any](t *testing.T, output string, normalize func(*T), expectedEntries ...*T) {
-	entries := parseJSONArrayOutput(t, output, normalize)
-	expectEntriesToMatch(t, entries, expectedEntries...)
-}
-
-// ExpectEntriesInMultipleArrayToMatch verifies that all the entries in expectedEntries are
-// matched by at least one entry in the output (multiple JSON array of JSON objects separated by newlines).
-func ExpectEntriesInMultipleArrayToMatch[T any](t *testing.T, output string, normalize func(*T), expectedEntries ...*T) {
-	entries := parseMultipleJSONArrayOutput(t, output, normalize)
-	expectEntriesToMatch(t, entries, expectedEntries...)
-}
 
 type CommonDataOption func(commonData *eventtypes.CommonData)
 
@@ -168,6 +51,17 @@ func WithContainerImageName(imageName string, isDockerRuntime bool) CommonDataOp
 	return func(commonData *eventtypes.CommonData) {
 		if !isDockerRuntime {
 			commonData.Runtime.ContainerImageName = imageName
+		}
+	}
+}
+
+// WithPodLabels sets the PodLabels to facilitate the tests
+func WithPodLabels(podName string, namespace string, enable bool) CommonDataOption {
+	return func(commonData *eventtypes.CommonData) {
+		if enable {
+			commonData.K8s.PodLabels = map[string]string{
+				"run": podName,
+			}
 		}
 	}
 }
@@ -190,6 +84,12 @@ func BuildCommonData(namespace string, options ...CommonDataOption) eventtypes.C
 	return e
 }
 
+func BuildCommonDataK8s(namespace string, options ...CommonDataOption) eventtypes.CommonData {
+	e := BuildCommonData(namespace, options...)
+	WithPodLabels("test-pod", namespace, true)(&e)
+	return e
+}
+
 func BuildBaseEvent(namespace string, options ...CommonDataOption) eventtypes.Event {
 	e := eventtypes.Event{
 		Type:       eventtypes.NORMAL,
@@ -198,6 +98,12 @@ func BuildBaseEvent(namespace string, options ...CommonDataOption) eventtypes.Ev
 	for _, option := range options {
 		option(&e.CommonData)
 	}
+	return e
+}
+
+func BuildBaseEventK8s(namespace string, options ...CommonDataOption) eventtypes.Event {
+	e := BuildBaseEvent(namespace, options...)
+	WithPodLabels("test-pod", namespace, true)(&e.CommonData)
 	return e
 }
 
@@ -252,6 +158,24 @@ func IsDockerRuntime(t *testing.T) bool {
 	return strings.Contains(ret, "docker")
 }
 
+// GetContainerRuntime returns the container runtime the cluster is using.
+func GetContainerRuntime() (string, error) {
+	cmd := exec.Command("kubectl", "get", "node", "-o", "jsonpath={.items[0].status.nodeInfo.containerRuntimeVersion}")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	r, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("getting container runtime: %w, %s", err, stderr.String())
+	}
+
+	ret := string(r)
+	parts := strings.Split(ret, ":")
+	if len(parts) < 1 {
+		return "", fmt.Errorf("unexpected container runtime version: %s", ret)
+	}
+	return parts[0], nil
+}
+
 // GetIPVersion returns the version of the IP, 4 or 6. It makes the test fail in case of error.
 // Based on https://stackoverflow.com/a/48519490
 func GetIPVersion(t *testing.T, address string) uint8 {
@@ -262,4 +186,18 @@ func GetIPVersion(t *testing.T, address string) uint8 {
 	}
 	t.Fatalf("Failed to determine IP version for address %s", address)
 	return 0
+}
+
+func StartRegistry(t *testing.T, name string) testutils.Container {
+	t.Helper()
+
+	c := testutils.NewDockerContainer(name, "registry serve /etc/docker/registry/config.yml",
+		testutils.WithImage("registry:2"),
+		testutils.WithoutWait(),
+		testutils.WithPortBindings(nat.PortMap{
+			"5000/tcp": []nat.PortBinding{{HostIP: "127.0.0.1"}},
+		}),
+	)
+	c.Start(t)
+	return c
 }

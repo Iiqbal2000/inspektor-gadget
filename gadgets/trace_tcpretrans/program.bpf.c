@@ -15,6 +15,9 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
 
+#include <gadget/buffer.h>
+#include <gadget/common.h>
+#include <gadget/macros.h>
 #include <gadget/maps.bpf.h>
 #include <gadget/mntns_filter.h>
 #include <gadget/types.h>
@@ -22,45 +25,50 @@
 #define GADGET_TYPE_TRACING
 #include <gadget/sockets-map.h>
 
-#define TASK_COMM_LEN 16
+enum type {
+	RETRANS,
+	LOSS,
+};
+
+enum tcp_flags_set : __u8 {
+	FIN = 0x01,
+	SYN = 0x02,
+	RST = 0x04,
+	PSH = 0x08,
+	ACK = 0x10,
+	URG = 0x20,
+	ECE = 0x40,
+	CWR = 0x80,
+};
 
 struct event {
+	gadget_timestamp timestamp_raw;
+	gadget_netns_id netns_id;
+	struct gadget_process proc;
+
 	struct gadget_l4endpoint_t src;
 	struct gadget_l4endpoint_t dst;
 
-	__u64 timestamp;
 	__u8 state;
-	__u8 tcpflags;
+	enum tcp_flags_set tcpflags_raw;
 	__u32 reason;
-	__u32 netns;
-
-	mnt_ns_id_t mntns_id;
-	__u32 pid;
-	__u32 tid;
-	__u32 uid;
-	__u32 gid;
-	__u8 task[TASK_COMM_LEN];
+	enum type type_raw;
 };
 
 /* Define here, because there are conflicts with include files */
 #define AF_INET 2
 #define AF_INET6 10
 
-// we need this to make sure the compiler doesn't remove our struct
-const struct event *unusedevent __attribute__((unused));
-
-struct {
-	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-	__uint(key_size, sizeof(__u32));
-	__type(value, struct event);
-} print_events SEC(".maps");
+GADGET_TRACER_MAP(events, 1024 * 256);
+GADGET_TRACER(tcpretrans, events, event);
 
 static __always_inline int __trace_tcp_retrans(void *ctx, const struct sock *sk,
-					       const struct sk_buff *skb)
+					       const struct sk_buff *skb,
+					       enum type type)
 {
 	struct inet_sock *sockp;
-	struct event event = {};
 	struct tcp_skb_cb *tcb;
+	struct event *event;
 	unsigned int family;
 
 	if (sk == NULL)
@@ -68,93 +76,103 @@ static __always_inline int __trace_tcp_retrans(void *ctx, const struct sock *sk,
 
 	if (BPF_CORE_READ_BITFIELD_PROBED(sk, sk_protocol) != IPPROTO_TCP)
 		return 0;
-	event.src.proto = event.dst.proto = IPPROTO_TCP;
+
+	event = gadget_reserve_buf(&events, sizeof(*event));
+	if (!event)
+		return 0;
+
+	event->src.proto_raw = event->dst.proto_raw = IPPROTO_TCP;
 
 	sockp = (struct inet_sock *)sk;
 
-	event.timestamp = bpf_ktime_get_boot_ns();
+	event->type_raw = type;
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
 
 	family = BPF_CORE_READ(sk, __sk_common.skc_family);
 	switch (family) {
 	case AF_INET:
-		event.src.l3.version = event.dst.l3.version = 4;
+		event->src.version = event->dst.version = 4;
 
-		BPF_CORE_READ_INTO(&event.src.l3.addr.v4, sk,
+		BPF_CORE_READ_INTO(&event->src.addr_raw.v4, sk,
 				   __sk_common.skc_rcv_saddr);
-		if (event.src.l3.addr.v4 == 0)
-			return 0;
+		if (event->src.addr_raw.v4 == 0)
+			goto cleanup;
 
-		BPF_CORE_READ_INTO(&event.dst.l3.addr.v4, sk,
+		BPF_CORE_READ_INTO(&event->dst.addr_raw.v4, sk,
 				   __sk_common.skc_daddr);
-		if (event.dst.l3.addr.v4 == 0)
-			return 0;
+		if (event->dst.addr_raw.v4 == 0)
+			goto cleanup;
 		break;
 
 	case AF_INET6:
-		event.src.l3.version = event.dst.l3.version = 6;
+		event->src.version = event->dst.version = 6;
 
 		BPF_CORE_READ_INTO(
-			&event.src.l3.addr.v6, sk,
+			&event->src.addr_raw.v6, sk,
 			__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-		if (((u64 *)event.src.l3.addr.v6)[0] == 0 &&
-		    ((u64 *)event.src.l3.addr.v6)[1] == 0)
-			return 0;
+		if (((u64 *)event->src.addr_raw.v6)[0] == 0 &&
+		    ((u64 *)event->src.addr_raw.v6)[1] == 0)
+			goto cleanup;
 
-		BPF_CORE_READ_INTO(&event.dst.l3.addr.v6, sk,
+		BPF_CORE_READ_INTO(&event->dst.addr_raw.v6, sk,
 				   __sk_common.skc_v6_daddr.in6_u.u6_addr32);
-		if (((u64 *)event.dst.l3.addr.v6)[0] == 0 &&
-		    ((u64 *)event.dst.l3.addr.v6)[1] == 0)
-			return 0;
+		if (((u64 *)event->dst.addr_raw.v6)[0] == 0 &&
+		    ((u64 *)event->dst.addr_raw.v6)[1] == 0)
+			goto cleanup;
 		break;
 
 	default:
 		// drop
-		return 0;
+		goto cleanup;
 	}
 
-	event.state = BPF_CORE_READ(sk, __sk_common.skc_state);
+	event->state = BPF_CORE_READ(sk, __sk_common.skc_state);
 
 	// The tcp_retransmit_skb tracepoint is fired with a skb that does not
 	// contain the TCP header because the TCP header is built on a cloned skb
 	// we don't have access to.
 	// skb->transport_header is not set: skb_transport_header_was_set() == false.
 	// Instead, we have to read the TCP flags from the TCP control buffer.
-	tcb = (struct tcp_skb_cb *)&(skb->cb[0]);
-	bpf_probe_read_kernel(&event.tcpflags, sizeof(event.tcpflags),
-			      &tcb->tcp_flags);
-
-	BPF_CORE_READ_INTO(&event.dst.port, sk, __sk_common.skc_dport);
-	event.dst.port = bpf_ntohs(
-		event.dst.port); // host expects data in host byte order
-	if (event.dst.port == 0)
-		return 0;
-
-	BPF_CORE_READ_INTO(&event.src.port, sockp, inet_sport);
-	event.src.port = bpf_ntohs(
-		event.src.port); // host expects data in host byte order
-	if (event.src.port == 0)
-		return 0;
-
-	BPF_CORE_READ_INTO(&event.netns, sk, __sk_common.skc_net.net, ns.inum);
-
-	struct sockets_value *skb_val = gadget_socket_lookup(sk, event.netns);
-
-	if (skb_val != NULL) {
-		event.mntns_id = skb_val->mntns;
-		// Use the mount namespace of the socket to filter by container
-		if (gadget_should_discard_mntns_id(event.mntns_id))
-			return 0;
-
-		event.pid = skb_val->pid_tgid >> 32;
-		event.tid = (__u32)skb_val->pid_tgid;
-		__builtin_memcpy(&event.task, skb_val->task,
-				 sizeof(event.task));
-		event.uid = (__u32)skb_val->uid_gid;
-		event.gid = (__u32)(skb_val->uid_gid >> 32);
+	if (skb) {
+		tcb = (struct tcp_skb_cb *)&(skb->cb[0]);
+		bpf_probe_read_kernel(&event->tcpflags_raw,
+				      sizeof(event->tcpflags_raw),
+				      &tcb->tcp_flags);
 	}
 
-	bpf_perf_event_output(ctx, &print_events, BPF_F_CURRENT_CPU, &event,
-			      sizeof(event));
+	BPF_CORE_READ_INTO(&event->dst.port, sk, __sk_common.skc_dport);
+	event->dst.port = bpf_ntohs(
+		event->dst.port); // host expects data in host byte order
+	if (event->dst.port == 0)
+		goto cleanup;
+
+	BPF_CORE_READ_INTO(&event->src.port, sockp, inet_sport);
+	event->src.port = bpf_ntohs(
+		event->src.port); // host expects data in host byte order
+	if (event->src.port == 0)
+		goto cleanup;
+
+	BPF_CORE_READ_INTO(&event->netns_id, sk, __sk_common.skc_net.net,
+			   ns.inum);
+
+	struct sockets_value *skb_val =
+		gadget_socket_lookup(sk, event->netns_id);
+
+	if (skb_val != NULL) {
+		// Use the mount namespace of the socket to filter by container
+		if (gadget_should_discard_mntns_id(skb_val->mntns))
+			goto cleanup;
+
+		gadget_process_populate_from_socket(skb_val, &event->proc);
+	}
+
+	gadget_submit_buf(ctx, &events, event, sizeof(*event));
+
+	return 0;
+
+cleanup:
+	gadget_discard_buf(event);
+
 	return 0;
 }
 
@@ -166,7 +184,13 @@ int ig_tcpretrans(struct trace_event_raw_tcp_event_sk_skb *ctx)
 	const struct sk_buff *skb = ctx->skbaddr;
 	const struct sock *sk = ctx->skaddr;
 
-	return __trace_tcp_retrans(ctx, sk, skb);
+	return __trace_tcp_retrans(ctx, sk, skb, RETRANS);
+}
+
+SEC("kprobe/tcp_send_loss_probe")
+int BPF_KPROBE(ig_tcplossprobe, struct sock *sk)
+{
+	return __trace_tcp_retrans(ctx, sk, NULL, LOSS);
 }
 
 char LICENSE[] SEC("license") = "GPL";

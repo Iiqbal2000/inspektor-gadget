@@ -128,10 +128,10 @@ func TestOpenTracer(t *testing.T) {
 					},
 					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
 					Pid:           uint32(info.Pid),
+					Tid:           uint32(info.Tid),
 					Uid:           uint32(info.Uid),
 					Comm:          info.Comm,
-					Fd:            fd,
-					Ret:           fd,
+					Fd:            uint32(fd),
 					Err:           0,
 					Path:          "/dev/null",
 					Flags:         []string{"O_RDONLY"},
@@ -162,10 +162,10 @@ func TestOpenTracer(t *testing.T) {
 					},
 					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
 					Pid:           uint32(info.Pid),
+					Tid:           uint32(info.Tid),
 					Uid:           uint32(info.Uid),
 					Comm:          info.Comm,
-					Fd:            fd,
-					Ret:           fd,
+					Fd:            uint32(fd),
 					Err:           0,
 					Path:          "/dev/null",
 					FullPath:      "",
@@ -200,10 +200,10 @@ func TestOpenTracer(t *testing.T) {
 					},
 					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
 					Pid:           uint32(info.Pid),
+					Tid:           uint32(info.Tid),
 					Uid:           uint32(info.Uid),
 					Comm:          info.Comm,
-					Fd:            fd,
-					Ret:           fd,
+					Fd:            uint32(fd),
 					Err:           0,
 					Path:          "/tmp/test_flags_and_mode",
 					FullPath:      "",
@@ -242,10 +242,10 @@ func TestOpenTracer(t *testing.T) {
 					},
 					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
 					Pid:           uint32(info.Pid),
+					Tid:           uint32(info.Tid),
 					Uid:           uint32(info.Uid),
 					Comm:          info.Comm,
-					Fd:            fd,
-					Ret:           fd,
+					Fd:            uint32(fd),
 					Err:           0,
 					Path:          relPath,
 					FullPath:      "/tmp/test_relative_path",
@@ -287,10 +287,10 @@ func TestOpenTracer(t *testing.T) {
 					},
 					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
 					Pid:           uint32(info.Pid),
+					Tid:           uint32(info.Tid),
 					Uid:           uint32(info.Uid),
 					Comm:          info.Comm,
-					Fd:            fd,
-					Ret:           fd,
+					Fd:            uint32(fd),
 					Err:           0,
 					Path:          "/tmp/test_symbolic_links",
 					FullPath:      "/dev/null",
@@ -331,10 +331,10 @@ func TestOpenTracer(t *testing.T) {
 					},
 					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
 					Pid:           uint32(info.Pid),
+					Tid:           uint32(info.Tid),
 					Uid:           uint32(info.Uid),
 					Comm:          info.Comm,
-					Fd:            fd,
-					Ret:           fd,
+					Fd:            uint32(fd),
 					Err:           0,
 					Path:          longPath[:254],
 					FullPath:      longPath,
@@ -342,6 +342,94 @@ func TestOpenTracer(t *testing.T) {
 					FlagsRaw:      unix.O_CREAT | unix.O_RDWR,
 					Mode:          "-rwxrw---x",
 					ModeRaw:       unix.S_IRWXU | unix.S_IRGRP | unix.S_IWGRP | unix.S_IXOTH,
+				}
+			}),
+		},
+		"test_prefix_on_directory": {
+			getTracerConfig: func(info *utilstest.RunnerInfo) *tracer.Config {
+				return &tracer.Config{
+					MountnsMap: utilstest.CreateMntNsFilterMap(t, info.MountNsID),
+					Prefixes:   []string{"/tmp/foo"},
+				}
+			},
+			generateEvent: func() (int, error) {
+				err := os.Mkdir("/tmp/foo", 0o750)
+				if err != nil {
+					return 0, fmt.Errorf("creating directory: %w", err)
+				}
+				defer os.RemoveAll("/tmp/foo")
+
+				fd, err := unix.Open("/tmp/foo/bar.test", unix.O_RDONLY|unix.O_CREAT, 0)
+				if err != nil {
+					return 0, fmt.Errorf("opening file: %w", err)
+				}
+				defer unix.Close(fd)
+
+				badfd, err := unix.Open("/tmp/quux.test", unix.O_RDONLY|unix.O_CREAT, 0)
+				if err != nil {
+					return 0, fmt.Errorf("opening file: %w", err)
+				}
+				defer unix.Close(badfd)
+
+				return fd, nil
+			},
+			validateEvent: utilstest.ExpectOneEvent(func(info *utilstest.RunnerInfo, fd int) *types.Event {
+				return &types.Event{
+					Event: eventtypes.Event{
+						Type: eventtypes.NORMAL,
+					},
+					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
+					Pid:           uint32(info.Pid),
+					Tid:           uint32(info.Tid),
+					Uid:           uint32(info.Uid),
+					Comm:          info.Comm,
+					Fd:            uint32(fd),
+					Err:           0,
+					Path:          "/tmp/foo/bar.test",
+					Flags:         []string{"O_RDONLY", "O_CREAT"},
+					FlagsRaw:      unix.O_RDONLY | unix.O_CREAT,
+					Mode:          "----------",
+				}
+			}),
+		},
+		"test_prefix_on_file": {
+			getTracerConfig: func(info *utilstest.RunnerInfo) *tracer.Config {
+				return &tracer.Config{
+					MountnsMap: utilstest.CreateMntNsFilterMap(t, info.MountNsID),
+					Prefixes:   []string{"/tmp/foo.test"},
+				}
+			},
+			generateEvent: func() (int, error) {
+				fd, err := unix.Open("/tmp/foo.test", unix.O_RDONLY|unix.O_CREAT, 0)
+				if err != nil {
+					return 0, fmt.Errorf("opening file: %w", err)
+				}
+				defer unix.Close(fd)
+
+				badfd, err := unix.Open("/tmp/quux.test", unix.O_RDONLY|unix.O_CREAT, 0)
+				if err != nil {
+					return 0, fmt.Errorf("opening file: %w", err)
+				}
+				defer unix.Close(badfd)
+
+				return fd, nil
+			},
+			validateEvent: utilstest.ExpectOneEvent(func(info *utilstest.RunnerInfo, fd int) *types.Event {
+				return &types.Event{
+					Event: eventtypes.Event{
+						Type: eventtypes.NORMAL,
+					},
+					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
+					Pid:           uint32(info.Pid),
+					Tid:           uint32(info.Tid),
+					Uid:           uint32(info.Uid),
+					Comm:          info.Comm,
+					Fd:            uint32(fd),
+					Err:           0,
+					Path:          "/tmp/foo.test",
+					Flags:         []string{"O_RDONLY", "O_CREAT"},
+					FlagsRaw:      unix.O_RDONLY | unix.O_CREAT,
+					Mode:          "----------",
 				}
 			}),
 		},
@@ -387,31 +475,8 @@ func TestOpenTracer(t *testing.T) {
 					t.Fatalf("One event expected")
 				}
 
-				utilstest.Equal(t, int(unix.ENOENT), events[0].Err,
+				utilstest.Equal(t, int(unix.ENOENT), int(events[0].Err),
 					"Captured event has bad Err")
-			},
-		},
-		"event_has_correct_ret_on_error": {
-			getTracerConfig: func(info *utilstest.RunnerInfo) *tracer.Config {
-				return &tracer.Config{
-					MountnsMap: utilstest.CreateMntNsFilterMap(t, info.MountNsID),
-				}
-			},
-			generateEvent: func() (int, error) {
-				_, err := unix.Open("non-existing-file", 0, 0)
-				if err == nil {
-					return 0, fmt.Errorf("error was expected")
-				}
-
-				return -1, nil
-			},
-			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ int, events []types.Event) {
-				if len(events) != 1 {
-					t.Fatalf("One event expected")
-				}
-
-				utilstest.Equal(t, -int(unix.ENOENT), events[0].Ret,
-					"Captured event has bad Ret")
 			},
 		},
 	} {
@@ -462,7 +527,7 @@ func TestOpenTracerMultipleMntNsIDsFilter(t *testing.T) {
 	// struct with only fields we want to check on this test
 	type expectedEvent struct {
 		mntNsID uint64
-		fd      int
+		fd      uint32
 	}
 
 	const n int = 5
@@ -485,8 +550,8 @@ func TestOpenTracerMultipleMntNsIDsFilter(t *testing.T) {
 
 	for i := 0; i < n; i++ {
 		utilstest.RunWithRunner(t, runners[i], func() error {
-			var err error
-			expectedEvents[i].fd, err = generateEvent()
+			fd, err := generateEvent()
+			expectedEvents[i].fd = uint32(fd)
 			return err
 		})
 	}

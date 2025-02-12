@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package tracer is deprecated.
+//
+// Deprecated: Switch to image-based gadgets instead. Check
+// https://github.com/inspektor-gadget/inspektor-gadget/tree/main/examples/gadgets
 package tracer
 
 import (
@@ -23,11 +27,13 @@ import (
 )
 
 const (
-	ParamCwd          = "cwd"
+	ParamPaths        = "paths"
 	ParamIgnoreErrors = "ignore-errors"
 )
 
-type GadgetDesc struct{}
+type GadgetDesc struct {
+	gadgets.GadgetDeprecated
+}
 
 func (g *GadgetDesc) Name() string {
 	return "exec"
@@ -48,9 +54,9 @@ func (g *GadgetDesc) Description() string {
 func (g *GadgetDesc) ParamDescs() params.ParamDescs {
 	return params.ParamDescs{
 		{
-			Key:          ParamCwd,
-			Title:        "Current working directory",
-			Description:  "Show current working directory",
+			Key:          ParamPaths,
+			Title:        "Additional paths",
+			Description:  "Show current working directory and executable path",
 			DefaultValue: "false",
 			TypeHint:     params.TypeBool,
 		},

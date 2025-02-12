@@ -102,6 +102,10 @@ func (t *Tracer) install() error {
 	}
 	t.reader = reader
 
+	if err := gadgets.FreezeMaps(t.objs.oomkillMaps.Events); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -114,9 +118,9 @@ func (t *Tracer) run() {
 				return
 			}
 
-			msg := fmt.Sprintf("Error reading perf ring buffer: %s", err)
-			t.eventCallback(types.Base(eventtypes.Err(msg)))
-			return
+			msg := fmt.Sprintf("reading perf ring buffer: %s", err)
+			t.eventCallback(types.Base(eventtypes.Warn(msg)))
+			continue
 		}
 
 		bpfEvent := (*oomkillDataT)(unsafe.Pointer(&record.RawSample[0]))

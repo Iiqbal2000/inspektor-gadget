@@ -35,9 +35,13 @@ type Event struct {
 	eventtypes.WithMountNsID
 	eventtypes.WithNetNsID
 
-	Pid  uint32 `json:"pid,omitempty" column:"pid,template:pid"`
-	Tid  uint32 `json:"tid,omitempty" column:"tid,template:pid"`
-	Comm string `json:"comm,omitempty" column:"comm,template:comm"`
+	Pid     uint32 `json:"pid,omitempty" column:"pid,template:pid"`
+	Tid     uint32 `json:"tid,omitempty" column:"tid,template:pid"`
+	Ppid    uint32 `json:"ppid,omitempty" column:"ppid,template:pid"`
+	Comm    string `json:"comm,omitempty" column:"comm,template:comm"`
+	Pcomm   string `json:"pcomm,omitempty" column:"pcomm,template:comm"`
+	Cwd     string `json:"cwd,omitempty" column:"cwd,width:40" columnTags:"param:paths"`
+	Exepath string `json:"exepath,omitempty" column:"exepath,width:40" columnTags:"param:paths"`
 
 	Uid uint32 `json:"uid" column:"uid,template:uid,hide"`
 	Gid uint32 `json:"gid" column:"gid,template:gid,hide"`
@@ -54,10 +58,10 @@ type Event struct {
 	PktType    string        `json:"pktType,omitempty" column:"type,minWidth:7,maxWidth:9"`
 	QType      string        `json:"qtype,omitempty" column:"qtype,minWidth:5,maxWidth:10"`
 	DNSName    string        `json:"name,omitempty" column:"name,width:30"`
-	Rcode      string        `json:"rcode,omitempty" column:"rcode,minWidth:8"`
+	Rcode      string        `json:"rcode,omitempty" column:"rcode,minWidth:12"`
 	Latency    time.Duration `json:"latency,omitempty" column:"latency,hide"`
 	NumAnswers int           `json:"numAnswers,omitempty" column:"numAnswers,width:8,maxWidth:8" columnDesc:"Number of addresses contained in the response."`
-	Addresses  []string      `json:"addresses,omitempty" column:"addresses,width:32,hide" columnDesc:"Addresses in the response. Maximum 8 are reported. Only available if the response is compressed."`
+	Addresses  []string      `json:"addresses,omitempty" column:"addresses,width:32,hide" columnDesc:"Addresses in the response."`
 }
 
 func GetColumns() *columns.Columns[Event] {
@@ -65,7 +69,7 @@ func GetColumns() *columns.Columns[Event] {
 
 	// Hide container column for kubernetes environment
 	if environment.Environment == environment.Kubernetes {
-		col, _ := cols.GetColumn("k8s.container")
+		col, _ := cols.GetColumn("k8s.containerName")
 		col.Visible = false
 	}
 

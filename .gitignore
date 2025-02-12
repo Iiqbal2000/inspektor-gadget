@@ -4,7 +4,10 @@
 *.dll
 *.so
 *.dylib
-/ig*
+/ig
+/ig-*-*
+/gadgetctl
+/gadgetctl-*-*
 /kubectl-gadget
 /kubectl-gadget-*-*
 /gadget-container/bin
@@ -34,6 +37,10 @@ pkg/btfgen/btfs/arm64/*
 *.o
 *.tgz
 # keep all bpf objects generated with bpf2go
-!pkg/gadgets/**/*.o
 !pkg/container-hook/**/*.o
+!pkg/kfilefields/**/*.o
+!pkg/gadgets/**/*.o
+!pkg/socketenricher/*.o
+
 !gadgets/*.o
+!testdata/*.o

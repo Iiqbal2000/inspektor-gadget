@@ -14,7 +14,9 @@
 
 package image
 
-import "github.com/spf13/cobra"
+import (
+	"github.com/spf13/cobra"
+)
 
 func NewImageCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -23,10 +25,14 @@ func NewImageCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(NewBuildCmd())
+	cmd.AddCommand(NewExportCmd())
+	cmd.AddCommand(NewImportCmd())
 	cmd.AddCommand(NewPushCmd())
 	cmd.AddCommand(NewPullCmd())
 	cmd.AddCommand(NewTagCmd())
 	cmd.AddCommand(NewListCmd())
+	cmd.AddCommand(NewInspectCmd())
+	cmd.AddCommand(NewRemoveCmd())
 
 	return cmd
 }

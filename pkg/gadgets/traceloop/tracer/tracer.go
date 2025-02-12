@@ -1,4 +1,4 @@
-// Copyright 2019-2023 The Inspektor Gadget authors
+// Copyright 2019-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,10 +33,10 @@ import (
 	"github.com/cilium/ebpf/perf"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/btfgen"
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
 	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
+	syscallhelpers "github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/traceloop/syscall-helpers"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/traceloop/types"
 	eventtypes "github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/syscalls"
@@ -44,8 +44,8 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type syscall_event_t -type syscall_event_cont_t -target ${TARGET} -cc clang -cflags ${CFLAGS} traceloop ./bpf/traceloop.bpf.c -- -I./bpf/
 
-// These variables must match content of traceloop.h.
-var (
+// These consts must match the content of traceloop.h.
+const (
 	useNullByteLength        uint64 = 0x0fffffffffffffff
 	useRetAsParamLength      uint64 = 0x0ffffffffffffffe
 	useArgIndexAsParamLength uint64 = 0x0ffffffffffffff0
@@ -53,15 +53,40 @@ var (
 
 	syscallEventTypeEnter uint8 = 0
 	syscallEventTypeExit  uint8 = 1
-)
 
-// This should match traceloop.h define SYSCALL_ARGS.
-var syscallArgs uint8 = 6
+	syscallArgs uint8 = 6
+)
 
 var (
 	syscallsOnce         sync.Once
-	syscallsDeclarations map[string]syscallDeclaration
+	syscallsDeclarations map[string]syscallhelpers.SyscallDeclaration
 )
+
+// TODO Find all syscalls which take a char * as argument and add them there.
+var syscallDefs = map[string][6]uint64{
+	"execve":      {useNullByteLength, 0, 0, 0, 0, 0},
+	"access":      {useNullByteLength, 0, 0, 0, 0, 0},
+	"open":        {useNullByteLength, 0, 0, 0, 0, 0},
+	"openat":      {0, useNullByteLength, 0, 0, 0, 0},
+	"mkdir":       {useNullByteLength, 0, 0, 0, 0, 0},
+	"chdir":       {useNullByteLength, 0, 0, 0, 0, 0},
+	"pivot_root":  {useNullByteLength, useNullByteLength, 0, 0, 0, 0},
+	"mount":       {useNullByteLength, useNullByteLength, useNullByteLength, 0, 0, 0},
+	"umount2":     {useNullByteLength, 0, 0, 0, 0, 0},
+	"sethostname": {useNullByteLength, 0, 0, 0, 0, 0},
+	"statfs":      {useNullByteLength, 0, 0, 0, 0, 0},
+	"stat":        {useNullByteLength, 0, 0, 0, 0, 0},
+	"statx":       {0, useNullByteLength, 0, 0, 0, 0},
+	"lstat":       {useNullByteLength, 0, 0, 0, 0, 0},
+	"fgetxattr":   {0, useNullByteLength, 0, 0, 0, 0},
+	"lgetxattr":   {useNullByteLength, useNullByteLength, 0, 0, 0, 0},
+	"getxattr":    {useNullByteLength, useNullByteLength, 0, 0, 0, 0},
+	"newfstatat":  {0, useNullByteLength, 0, 0, 0, 0},
+	"read":        {0, useRetAsParamLength | paramProbeAtExitMask, 0, 0, 0, 0},
+	"write":       {0, useArgIndexAsParamLength + 2, 0, 0, 0, 0},
+	"getcwd":      {useNullByteLength | paramProbeAtExitMask, 0, 0, 0, 0, 0},
+	"pread64":     {0, useRetAsParamLength | paramProbeAtExitMask, 0, 0, 0, 0},
+}
 
 type containerRingReader struct {
 	perfReader *perf.Reader
@@ -86,6 +111,8 @@ type Tracer struct {
 	cancel        context.CancelFunc
 	eventCallback func(event *types.Event)
 	waitGroup     sync.WaitGroup
+
+	syscallFilters []string
 }
 
 type syscallEvent struct {
@@ -108,9 +135,10 @@ type syscallEventContinued struct {
 	param              string
 }
 
-func NewTracer(enricher gadgets.DataEnricherByMntNs) (*Tracer, error) {
+func NewTracer(enricher gadgets.DataEnricherByMntNs, filters []string) (*Tracer, error) {
 	t := &Tracer{
-		enricher: enricher,
+		enricher:       enricher,
+		syscallFilters: filters,
 	}
 	if err := t.install(); err != nil {
 		t.close()
@@ -128,7 +156,7 @@ func (t *Tracer) install() error {
 	gadgets.FixBpfKtimeGetBootNs(spec.Programs)
 
 	syscallsOnce.Do(func() {
-		syscallsDeclarations, err = gatherSyscallsDeclarations()
+		syscallsDeclarations, err = syscallhelpers.GatherSyscallsDeclarations()
 	})
 	if err != nil {
 		return fmt.Errorf("gathering syscall definitions: %w", err)
@@ -151,13 +179,28 @@ func (t *Tracer) install() error {
 		})
 	}
 
-	opts := ebpf.CollectionOptions{
-		Programs: ebpf.ProgramOptions{
-			KernelTypes: btfgen.GetBTFSpec(),
-		},
+	// Fill the syscall filter map with the corresponding syscall numbers.
+	syscallFiltersMapSpec := spec.Maps["syscall_filters"]
+	for _, name := range t.syscallFilters {
+		if name == "" {
+			continue
+		}
+
+		number, ok := syscalls.GetSyscallNumberByName(name)
+		if !ok {
+			return fmt.Errorf("syscall %q does not exist", name)
+		}
+
+		syscallFiltersMapSpec.Contents = append(syscallFiltersMapSpec.Contents, ebpf.MapKV{
+			Key: uint64(number),
+			// We do not care about the value itself but we need to provide one.
+			Value: true,
+		})
 	}
 
-	if err := spec.LoadAndAssign(&t.objs, &opts); err != nil {
+	consts := make(map[string]interface{})
+	consts["filter_syscall"] = len(syscallFiltersMapSpec.Contents) > 0
+	if err := gadgets.LoadeBPFSpec(nil, spec, consts, &t.objs); err != nil {
 		return fmt.Errorf("loading ebpf program: %w", err)
 	}
 
@@ -237,7 +280,7 @@ func (t *Tracer) Attach(containerID string, mntnsID uint64) error {
 }
 
 func timestampFromEvent(event *syscallEvent) eventtypes.Time {
-	if !gadgets.DetectBpfKtimeGetBootNs() {
+	if !gadgets.HasBpfKtimeGetBootNs() {
 		// Traceloop works differently than other gadgets: if the
 		// kernel does not support bpf_ktime_get_boot_ns, don't
 		// generate a timestamp from userspace because traceloop reads
@@ -454,26 +497,26 @@ func (t *Tracer) Read(containerID string) ([]*types.Event, error) {
 				Pid:           enterEvent.pid,
 				Comm:          enterEvent.comm,
 				WithMountNsID: eventtypes.WithMountNsID{MountNsID: enterEvent.mountNsID},
-				Syscall:       syscallGetName(enterEvent.id),
+				Syscall:       syscallhelpers.SyscallGetName(enterEvent.id),
 			}
 
-			syscallDeclaration, err := getSyscallDeclaration(syscallsDeclarations, event.Syscall)
+			syscallDeclaration, err := syscallhelpers.GetSyscallDeclaration(syscallsDeclarations, event.Syscall)
 			if err != nil {
 				return nil, fmt.Errorf("getting syscall definition")
 			}
 
-			parametersNumber := syscallDeclaration.getParameterCount()
+			parametersNumber := syscallDeclaration.GetParameterCount()
 			event.Parameters = make([]types.SyscallParam, parametersNumber)
 			log.Debugf("\tevent parametersNumber: %d", parametersNumber)
 
 			for i := uint8(0); i < parametersNumber; i++ {
-				paramName, err := syscallDeclaration.getParameterName(i)
+				paramName, err := syscallDeclaration.GetParameterName(i)
 				if err != nil {
 					return nil, fmt.Errorf("getting syscall parameter name: %w", err)
 				}
 				log.Debugf("\t\tevent paramName: %q", paramName)
 
-				isPointer, err := syscallDeclaration.paramIsPointer(i)
+				isPointer, err := syscallDeclaration.ParamIsPointer(i)
 				if err != nil {
 					return nil, fmt.Errorf("checking syscall parameter is a pointer: %w", err)
 				}
@@ -562,7 +605,7 @@ func (t *Tracer) Read(containerID string) ([]*types.Event, error) {
 	// events to be published.
 	for _, enterTimestampEvents := range syscallEnterEventsMap {
 		for _, enterEvent := range enterTimestampEvents {
-			syscallName := syscallGetName(enterEvent.id)
+			syscallName := syscallhelpers.SyscallGetName(enterEvent.id)
 
 			incompleteEnterEvent := &types.Event{
 				Event: eventtypes.Event{
@@ -589,7 +632,7 @@ func (t *Tracer) Read(containerID string) ([]*types.Event, error) {
 
 	for _, exitTimestampEvents := range syscallExitEventsMap {
 		for _, exitEvent := range exitTimestampEvents {
-			syscallName := syscallGetName(exitEvent.id)
+			syscallName := syscallhelpers.SyscallGetName(exitEvent.id)
 
 			incompleteExitEvent := &types.Event{
 				Event: eventtypes.Event{
@@ -620,7 +663,7 @@ func (t *Tracer) Read(containerID string) ([]*types.Event, error) {
 	})
 
 	// Remove timestamps if we couldn't get reliable ones
-	if !gadgets.DetectBpfKtimeGetBootNs() {
+	if !gadgets.HasBpfKtimeGetBootNs() {
 		for i := range events {
 			events[i].Timestamp = 0
 		}
@@ -658,6 +701,8 @@ func (g *GadgetDesc) NewInstance() (gadgets.Gadget, error) {
 }
 
 func (t *Tracer) Init(gadgetCtx gadgets.GadgetContext) error {
+	t.syscallFilters = gadgetCtx.GadgetParams().Get(ParamSyscallFilters).AsStringSlice()
+
 	if err := t.install(); err != nil {
 		t.close()
 		return fmt.Errorf("installing tracer: %w", err)
@@ -689,11 +734,11 @@ func (t *Tracer) AttachContainer(container *containercollection.Container) error
 		<-t.ctx.Done()
 		evs, err := t.Read(container.Runtime.ContainerID)
 		if err != nil {
-			t.gadgetCtx.Logger().Debugf("error reading from container %s: %v", container.Runtime.ContainerID, err)
+			t.gadgetCtx.Logger().Warnf("error reading from container %s: %v", container.Runtime.ContainerID, err)
 			return
 		}
 		for _, ev := range evs {
-			ev.SetContainerMetadata(&container.K8s.BasicK8sMetadata, &container.Runtime.BasicRuntimeMetadata)
+			ev.SetContainerMetadata(container)
 			t.eventCallback(ev)
 		}
 	}()

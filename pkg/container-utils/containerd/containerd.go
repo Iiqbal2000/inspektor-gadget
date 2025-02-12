@@ -20,13 +20,14 @@ import (
 	"time"
 
 	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/pkg/cri/constants"
+	"github.com/containerd/errdefs"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/cri"
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
 	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
@@ -47,10 +48,23 @@ type ContainerdClient struct {
 	ctx    context.Context
 }
 
-func NewContainerdClient(socketPath string, config *containerutilsTypes.ExtraConfig) (runtimeclient.ContainerRuntimeClient, error) {
+func NewContainerdClient(socketPath string, protocol string, config *containerutilsTypes.ExtraConfig) (runtimeclient.ContainerRuntimeClient, error) {
 	if socketPath == "" {
 		socketPath = runtimeclient.ContainerdDefaultSocketPath
 	}
+
+	switch protocol {
+	// Empty string falls back to "internal". Used by unit tests.
+	case "", containerutilsTypes.RuntimeProtocolInternal:
+		// handled below
+
+	case containerutilsTypes.RuntimeProtocolCRI:
+		return cri.NewCRIClient(types.RuntimeNameContainerd, socketPath, DefaultTimeout)
+
+	default:
+		return nil, fmt.Errorf("unknown runtime protocol %q", protocol)
+	}
+
 	namespace := constants.K8sContainerdNamespace
 	if config != nil && config.Namespace != "" {
 		namespace = config.Namespace
@@ -58,6 +72,7 @@ func NewContainerdClient(socketPath string, config *containerutilsTypes.ExtraCon
 
 	dialCtx, cancelFunc := context.WithTimeout(context.TODO(), DefaultTimeout)
 	defer cancelFunc()
+	//nolint:staticcheck
 	grpcConn, err := grpc.DialContext(
 		dialCtx,
 		"unix:"+socketPath,
@@ -127,33 +142,7 @@ func (c *ContainerdClient) GetContainer(containerID string) (*runtimeclient.Cont
 		return nil, err
 	}
 
-	labels, err := container.Labels(c.ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing labels of container %q: %w", container.ID(), err)
-	}
-
-	image, err := container.Image(c.ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting image details %q: %w", container.ID(), err)
-	}
-
-	// State is getting set to `Running` here for the following reasons:
-	// 1. GetContainer is only getting called on new created containers
-	// 2. We would need to get the Task for the Container. containerd needs to aquire a mutex
-	//    that is currently hold by the creating process, which we interrupted -> deadlock
-	containerData := &runtimeclient.ContainerData{
-		Runtime: runtimeclient.RuntimeContainerData{
-			BasicRuntimeMetadata: types.BasicRuntimeMetadata{
-				ContainerID:        container.ID(),
-				ContainerName:      getContainerName(container, labels),
-				RuntimeName:        types.RuntimeNameContainerd,
-				ContainerImageName: image.Name(),
-			},
-			State: runtimeclient.StateRunning,
-		},
-	}
-	runtimeclient.EnrichWithK8sMetadata(containerData, labels)
-	return containerData, nil
+	return c.buildContainerData(container, nil)
 }
 
 func (c *ContainerdClient) GetContainerDetails(containerID string) (*runtimeclient.ContainerDetailsData, error) {
@@ -269,32 +258,7 @@ func (c *ContainerdClient) getContainerTask(container containerd.Container) (*co
 // Constructs a ContainerData from a containerTask and containerd.Container
 // The extra containerd.Container parameter saves an additional call to the API
 func (c *ContainerdClient) taskAndContainerToContainerData(task *containerTask, container containerd.Container) (*runtimeclient.ContainerData, error) {
-	labels, err := container.Labels(c.ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing labels of container %q: %w", container.ID(), err)
-	}
-
-	image, err := container.Image(c.ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting image of container %q: %w", container.ID(), err)
-	}
-
-	imageMetadata := image.Metadata()
-
-	containerData := &runtimeclient.ContainerData{
-		Runtime: runtimeclient.RuntimeContainerData{
-			BasicRuntimeMetadata: types.BasicRuntimeMetadata{
-				ContainerID:          container.ID(),
-				ContainerName:        getContainerName(container, labels),
-				RuntimeName:          types.RuntimeNameContainerd,
-				ContainerImageName:   image.Name(),
-				ContainerImageDigest: imageMetadata.Target.Digest.String(),
-			},
-			State: task.status,
-		},
-	}
-	runtimeclient.EnrichWithK8sMetadata(containerData, labels)
-	return containerData, nil
+	return c.buildContainerData(container, task)
 }
 
 // Checks if the K8s Label for the Containerkind equals to sandbox
@@ -334,4 +298,43 @@ func getContainerName(container containerd.Container, labels map[string]string) 
 	}
 
 	return container.ID()
+}
+
+// buildContainerData  retrieves and sets basic runtime metadata for a given container,
+// including its ID, name, runtime name, image name, and image digest. It also retrieves and sets
+// the container's state (which is set to "Running" by default, unless a container task is provided).
+func (c *ContainerdClient) buildContainerData(container containerd.Container, task *containerTask) (*runtimeclient.ContainerData, error) {
+	labels, err := container.Labels(c.ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing labels of container %q: %w", container.ID(), err)
+	}
+
+	image, err := container.Image(c.ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting image of container %q: %w", container.ID(), err)
+	}
+
+	// When `task` is nil, state is getting set to `Running` for the following reasons:
+	// 1. `buildContainerData` is called by `GetContainer`, which is only getting called on
+	//    new created containers
+	// 2. We would need to get the Task for the Container. containerd needs to acquire a mutex
+	//    that is currently hold by the creating process, which we interrupted -> deadlock
+	taskState := runtimeclient.StateRunning
+	if task != nil {
+		taskState = task.status
+	}
+
+	containerData := &runtimeclient.ContainerData{
+		Runtime: runtimeclient.RuntimeContainerData{
+			ContainerID:          container.ID(),
+			ContainerName:        getContainerName(container, labels),
+			RuntimeName:          types.RuntimeNameContainerd,
+			ContainerImageName:   image.Name(),
+			ContainerImageDigest: image.Metadata().Target.Digest.String(),
+			State:                taskState,
+		},
+	}
+	runtimeclient.EnrichWithK8sMetadata(containerData, labels)
+
+	return containerData, nil
 }
