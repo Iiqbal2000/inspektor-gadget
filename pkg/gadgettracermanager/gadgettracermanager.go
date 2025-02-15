@@ -34,7 +34,6 @@ import (
 	pb "github.com/inspektor-gadget/inspektor-gadget/pkg/gadgettracermanager/api"
 	containersmap "github.com/inspektor-gadget/inspektor-gadget/pkg/gadgettracermanager/containers-map"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/runcfanotify"
 	tracercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/tracer-collection"
 	eventtypes "github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
@@ -165,21 +164,23 @@ func (g *GadgetTracerManager) AddContainer(_ context.Context, containerDefinitio
 	container := containercollection.Container{
 		Runtime: containercollection.RuntimeMetadata{
 			BasicRuntimeMetadata: eventtypes.BasicRuntimeMetadata{
-				ContainerID: containerDefinition.Id,
+				ContainerID:  containerDefinition.Id,
+				ContainerPID: containerDefinition.Pid,
 			},
 		},
-		Pid: containerDefinition.Pid,
 		K8s: containercollection.K8sMetadata{
 			BasicK8sMetadata: eventtypes.BasicK8sMetadata{
 				Namespace:     containerDefinition.Namespace,
 				PodName:       containerDefinition.Podname,
 				ContainerName: containerDefinition.Name,
 			},
-			PodLabels: map[string]string{},
 		},
 	}
-	for _, l := range containerDefinition.Labels {
-		container.K8s.PodLabels[l.Key] = l.Value
+	if containerDefinition.LabelsSet {
+		container.K8s.PodLabels = make(map[string]string)
+		for _, l := range containerDefinition.Labels {
+			container.K8s.PodLabels[l.Key] = l.Value
+		}
 	}
 	if containerDefinition.OciConfig != "" {
 		containerConfig := &ocispec.Spec{}
@@ -268,6 +269,7 @@ func NewServer(conf *Conf) (*GadgetTracerManager, error) {
 		opts = append(opts, containercollection.WithLinuxNamespaceEnrichment())
 		opts = append(opts, containercollection.WithKubernetesEnrichment(g.nodeName, nil))
 		opts = append(opts, containercollection.WithTracerCollection(g.tracerCollection))
+		opts = append(opts, containercollection.WithProcEnrichment())
 	}
 
 	podInformerUsed := false
@@ -284,10 +286,6 @@ func NewServer(conf *Conf) (*GadgetTracerManager, error) {
 			log.Infof("GadgetTracerManager: hook mode: fanotify+ebpf (auto)")
 			opts = append(opts, containercollection.WithContainerFanotifyEbpf())
 			opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName))
-		} else if runcfanotify.Supported() {
-			log.Infof("GadgetTracerManager: hook mode: fanotify (auto)")
-			opts = append(opts, containercollection.WithRuncFanotify())
-			opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName))
 		} else {
 			log.Infof("GadgetTracerManager: hook mode: podinformer (auto)")
 			opts = append(opts, containercollection.WithPodInformer(g.nodeName))
@@ -297,10 +295,6 @@ func NewServer(conf *Conf) (*GadgetTracerManager, error) {
 		log.Infof("GadgetTracerManager: hook mode: podinformer")
 		opts = append(opts, containercollection.WithPodInformer(g.nodeName))
 		podInformerUsed = true
-	case "fanotify":
-		log.Infof("GadgetTracerManager: hook mode: fanotify")
-		opts = append(opts, containercollection.WithRuncFanotify())
-		opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName))
 	case "fanotify+ebpf":
 		log.Infof("GadgetTracerManager: hook mode: fanotify+ebpf")
 		opts = append(opts, containercollection.WithContainerFanotifyEbpf())

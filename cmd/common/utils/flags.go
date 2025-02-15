@@ -17,10 +17,12 @@ package utils
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
@@ -28,11 +30,13 @@ import (
 )
 
 const (
-	OutputModeJSON          = "json"
-	OutputModeCustomColumns = "custom-columns"
+	OutputModeColumns    = "columns"
+	OutputModeJSON       = "json"
+	OutputModeJSONPretty = "jsonpretty"
+	OutputModeYAML       = "yaml"
 )
 
-var SupportedOutputModes = []string{OutputModeJSON, OutputModeCustomColumns}
+var SupportedOutputModes = []string{OutputModeJSON, OutputModeColumns}
 
 // OutputConfig contains the flags that describes how to print the gadget's output
 type OutputConfig struct {
@@ -70,27 +74,27 @@ func (config *OutputConfig) ParseOutputConfig() error {
 
 	switch {
 	case len(config.OutputMode) == 0:
-		config.OutputMode = OutputModeCustomColumns
+		config.OutputMode = OutputModeColumns
 		return nil
 	case config.OutputMode == OutputModeJSON:
 		return nil
-	case strings.HasPrefix(config.OutputMode, OutputModeCustomColumns):
+	case strings.HasPrefix(config.OutputMode, OutputModeColumns):
 		parts := strings.Split(config.OutputMode, "=")
 		if len(parts) != 2 {
-			return WrapInErrInvalidArg(OutputModeCustomColumns,
+			return WrapInErrInvalidArg(OutputModeColumns,
 				errors.New("expects a comma separated list of columns to use"))
 		}
 
 		cols := strings.Split(strings.ToLower(parts[1]), ",")
 		for _, col := range cols {
 			if len(col) == 0 {
-				return WrapInErrInvalidArg(OutputModeCustomColumns,
+				return WrapInErrInvalidArg(OutputModeColumns,
 					errors.New("column can't be empty"))
 			}
 		}
 
 		config.CustomColumns = cols
-		config.OutputMode = OutputModeCustomColumns
+		config.OutputMode = OutputModeColumns
 		return nil
 	default:
 		return WrapInErrOutputModeNotSupported(config.OutputMode)
@@ -145,10 +149,57 @@ func AddRegistryAuthVariablesAndFlags(cmd *cobra.Command, authOptions *oci.AuthO
 	viper.BindPFlag("registry.auth_file", cmd.Flags().Lookup("authfile"))
 	viper.BindEnv("registry.auth_file", "REGISTRY_AUTH_FILE")
 
-	cmd.Flags().BoolVar(
-		&authOptions.Insecure,
-		"insecure",
-		false,
-		"Allow connections to HTTP only registries",
+	cmd.Flags().StringSliceVar(
+		&authOptions.InsecureRegistries,
+		"insecure-registries",
+		[]string{},
+		"List of registries to access over plain HTTP",
 	)
+}
+
+// removeSplitSortArgs removes the --sort flag with its arg, if it isn't in the
+// merged form of --sort=foo
+func removeSplitSortArgs(args []string) []string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--sort" {
+			// Remove also the next element as it is the arg of --sort
+			return append(args[:i], args[i+2:]...)
+		}
+	}
+	return args
+}
+
+// removeHelpArg removes the --help flag
+func removeHelpArg(args []string) []string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--help" || args[i] == "-h" {
+			return append(args[:i], args[i+1:]...)
+		}
+	}
+	return args
+}
+
+func ParseEarlyFlags(cmd *cobra.Command, rawArgs []string) error {
+	// Do not error out on unknown flags, but still validate currently
+	// known ones.
+	// Other flags will be validated in the `Execute()` call and unknown
+	// ones will be rejected
+
+	cmd.FParseErrWhitelist.UnknownFlags = true
+	defer func() {
+		cmd.FParseErrWhitelist.UnknownFlags = false
+	}()
+	// temporary workaround for https://github.com/inspektor-gadget/inspektor-gadget/pull/2174#issuecomment-1780923952
+	args := slices.Clone(rawArgs) // clone to avoid modifying the original os.Args
+	args = removeSplitSortArgs(args)
+	// --help should be handled after we registered all commands
+	args = removeHelpArg(args)
+	err := cmd.ParseFlags(args)
+	return err
+}
+
+func CopyFlagSet(fs *pflag.FlagSet) *pflag.FlagSet {
+	flags := pflag.NewFlagSet("", pflag.ContinueOnError)
+	flags.AddFlagSet(fs)
+	return flags
 }

@@ -29,21 +29,22 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/btfgen"
 	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/internal/socketenricher"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/trace/tcpretrans/types"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/socketenricher"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/tcpbits"
 	eventtypes "github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $TARGET -cc clang -cflags ${CFLAGS} -no-global-types -type event tcpretrans ./bpf/tcpretrans.bpf.c -- -I./bpf/
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $TARGET -cc clang -cflags ${CFLAGS} -no-global-types -type event -type type tcpretrans ./bpf/tcpretrans.bpf.c -- -I./bpf/
 
 type Tracer struct {
-	socketEnricher *socketenricher.SocketEnricher
+	socketEnricherMap *ebpf.Map
 
 	eventCallback func(*types.Event)
 
 	objs              tcpretransObjects
 	retransmitSkbLink link.Link
+	lossSkbLink       link.Link
 	reader            *perf.Reader
 }
 
@@ -71,15 +72,16 @@ func (t *Tracer) SetEventHandler(handler any) {
 	t.eventCallback = nh
 }
 
+func (t *Tracer) SetSocketEnricherMap(m *ebpf.Map) {
+	t.socketEnricherMap = m
+}
+
 func (t *Tracer) close() {
 	t.retransmitSkbLink = gadgets.CloseLink(t.retransmitSkbLink)
+	t.lossSkbLink = gadgets.CloseLink(t.lossSkbLink)
 
 	if t.reader != nil {
 		t.reader.Close()
-	}
-
-	if t.socketEnricher != nil {
-		t.socketEnricher.Close()
 	}
 
 	t.objs.Close()
@@ -87,10 +89,6 @@ func (t *Tracer) close() {
 
 func (t *Tracer) install() error {
 	var err error
-	t.socketEnricher, err = socketenricher.NewSocketEnricher()
-	if err != nil {
-		return err
-	}
 
 	spec, err := loadTcpretrans()
 	if err != nil {
@@ -106,7 +104,7 @@ func (t *Tracer) install() error {
 	}
 
 	mapReplacements := map[string]*ebpf.Map{}
-	mapReplacements[socketenricher.SocketsMapName] = t.socketEnricher.SocketsMap()
+	mapReplacements[socketenricher.SocketsMapName] = t.socketEnricherMap
 	opts.MapReplacements = mapReplacements
 
 	if err := spec.LoadAndAssign(&t.objs, &opts); err != nil {
@@ -118,11 +116,20 @@ func (t *Tracer) install() error {
 		return fmt.Errorf("attaching tracepoint tcp_retransmit_skb: %w", err)
 	}
 
+	t.lossSkbLink, err = link.Kprobe("tcp_send_loss_probe", t.objs.IgTcplossprobe, nil)
+	if err != nil {
+		return fmt.Errorf("attaching kprobe tcp_send_loss_probe: %w", err)
+	}
+
 	reader, err := perf.NewReader(t.objs.tcpretransMaps.Events, gadgets.PerfBufferPages*os.Getpagesize())
 	if err != nil {
 		return fmt.Errorf("creating perf ring buffer: %w", err)
 	}
 	t.reader = reader
+
+	if err := gadgets.FreezeMaps(t.objs.tcpretransMaps.Events); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -137,8 +144,8 @@ func (t *Tracer) run() {
 			}
 
 			msg := fmt.Sprintf("reading perf ring buffer: %s", err)
-			t.eventCallback(types.Base(eventtypes.Err(msg)))
-			return
+			t.eventCallback(types.Base(eventtypes.Warn(msg)))
+			continue
 		}
 
 		if record.LostSamples > 0 {
@@ -150,6 +157,14 @@ func (t *Tracer) run() {
 		bpfEvent := (*tcpretransEvent)(unsafe.Pointer(&record.RawSample[0]))
 
 		ipversion := gadgets.IPVerFromAF(bpfEvent.Af)
+
+		typ := "unknown"
+		switch bpfEvent.Type {
+		case tcpretransTypeRETRANS:
+			typ = "RETRANS"
+		case tcpretransTypeLOSS:
+			typ = "LOSS"
+		}
 
 		event := types.Event{
 			Event: eventtypes.Event{
@@ -179,6 +194,7 @@ func (t *Tracer) run() {
 			},
 			State:    tcpbits.TCPState(bpfEvent.State),
 			Tcpflags: tcpbits.TCPFlags(bpfEvent.Tcpflags),
+			Type:     typ,
 		}
 
 		t.eventCallback(&event)

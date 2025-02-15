@@ -24,6 +24,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
@@ -85,6 +86,19 @@ type Command struct {
 	stderr bytes.Buffer
 }
 
+var (
+	seed int64      = time.Now().UTC().UnixNano()
+	r    *rand.Rand = rand.New(rand.NewSource(seed))
+)
+
+func GetSeed() int64 {
+	return seed
+}
+
+func (c *Command) DisplayName() string {
+	return c.Name
+}
+
 func (c *Command) IsCleanup() bool {
 	return c.Cleanup
 }
@@ -95,22 +109,6 @@ func (c *Command) IsStartAndStop() bool {
 
 func (c *Command) Running() bool {
 	return c.started
-}
-
-// DeployInspektorGadget deploys inspector gadget in Kubernetes
-func DeployInspektorGadget(image, imagePullPolicy string) *Command {
-	cmd := fmt.Sprintf("$KUBECTL_GADGET deploy --image-pull-policy=%s --debug --experimental",
-		imagePullPolicy)
-
-	if image != "" {
-		cmd = cmd + " --image=" + image
-	}
-
-	return &Command{
-		Name:           "DeployInspektorGadget",
-		Cmd:            cmd,
-		ExpectedRegexp: "Inspektor Gadget successfully deployed",
-	}
 }
 
 func DeploySPO(limitReplicas, patchWebhookConfig, bestEffortResourceMgmt bool) *Command {
@@ -185,13 +183,6 @@ kubectl rollout status -n security-profiles-operator ds spod --timeout=180s || \
 	}
 }
 
-// CleanupInspektorGadget cleans up inspector gadget in Kubernetes
-var CleanupInspektorGadget = &Command{
-	Name:    "CleanupInspektorGadget",
-	Cmd:     "$KUBECTL_GADGET undeploy",
-	Cleanup: true,
-}
-
 // CleanupSPO cleans up security profile operator in Kubernetes
 var CleanupSPO = []*Command{
 	{
@@ -261,12 +252,12 @@ func PrintLogsFn(namespaces ...string) func(t *testing.T) {
 
 		if DefaultTestComponent == InspektorGadgetTestComponent {
 			t.Logf("Inspektor Gadget pod logs:")
-			t.Logf(getPodLogs("gadget"))
+			t.Log(getPodLogs("gadget"))
 		}
 
 		for _, ns := range namespaces {
 			t.Logf("Logs in namespace %s:", ns)
-			t.Logf(getPodLogs(ns))
+			t.Log(getPodLogs(ns))
 		}
 	}
 }
@@ -280,9 +271,10 @@ func getPodLogs(ns string) string {
 	var sb strings.Builder
 	logCommands := []string{
 		fmt.Sprintf("kubectl get pods -n %s -o wide", ns),
-		fmt.Sprintf(`for pod in $(kubectl get pods -n %s -o name); do
-			kubectl logs -n %s $pod;
-		done`, ns, ns),
+		fmt.Sprintf(`for pod in $(kubectl get pods -n %[1]s -o name); do
+			kubectl logs -n %[1]s $pod --previous;
+			kubectl logs -n %[1]s $pod;
+		done`, ns),
 	}
 
 	for _, c := range logCommands {
@@ -339,7 +331,7 @@ func (c *Command) verifyOutputWihoutTest() error {
 }
 
 // kill kills a command by sending SIGKILL because we want to stop the process
-// immediatly and avoid that the signal is trapped.
+// immediately and avoid that the signal is trapped.
 func (c *Command) kill() error {
 	const sig syscall.Signal = syscall.SIGKILL
 
@@ -354,7 +346,7 @@ func (c *Command) kill() error {
 	// in our case, the process of /bin/sh and c.Cmd.
 	err := syscall.Kill(-c.command.Process.Pid, sig)
 	if err != nil {
-		return err
+		return fmt.Errorf("killing command(%s): %w", c.Name, err)
 	}
 
 	// In some cases, we do not have to wait here because the Cmd was executed
@@ -370,22 +362,19 @@ func (c *Command) kill() error {
 		// do not return error, it is what we were expecting.
 		var exiterr *exec.ExitError
 		if ok := errors.As(err, &exiterr); !ok {
-			return err
+			return fmt.Errorf("command returned error(%s): %w", c.Name, err)
 		}
 
 		waitStatus, ok := exiterr.Sys().(syscall.WaitStatus)
 		if !ok {
-			return err
+			return fmt.Errorf("command returned error(%s): %w", c.Name, err)
 		}
 
 		if waitStatus.Signal() != sig {
-			return err
+			return fmt.Errorf("command returned error(%s): %w", c.Name, err)
 		}
-
-		return nil
 	}
-
-	return err
+	return nil
 }
 
 // RunWithoutTest runs the Command, this is thought to be used in TestMain().
@@ -457,7 +446,7 @@ func (c *Command) KillWithoutTest() error {
 	fmt.Printf("Kill command(%s)\n", c.Name)
 
 	if err := c.kill(); err != nil {
-		return fmt.Errorf("killing command(%s): %w", c.Name, err)
+		return err
 	}
 
 	return nil
@@ -507,11 +496,44 @@ func (c *Command) Stop(t *testing.T) {
 	err := c.kill()
 	t.Logf("Command returned(%s):\n%s\n%s\n",
 		c.Name, c.stderr.String(), c.stdout.String())
-	require.NoError(t, err, "failed to kill command(%s)", c.Name)
+	require.NoError(t, err)
 
 	c.verifyOutput(t)
 
 	c.started = false
+}
+
+// JobCommand returns a Command which runs a job with a specified image, command and args
+func JobCommand(jobname, image, namespace, command string, commandArgs ...string) *Command {
+	cmdLine := ""
+	if command != "" {
+		cmdLine = fmt.Sprintf("\n        command:\n         - %s", command)
+	}
+
+	for _, arg := range commandArgs {
+		cmdLine = cmdLine + fmt.Sprintf("\n         - %s", arg)
+	}
+
+	cmd := fmt.Sprintf(`kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: %s
+        image: %s%s
+EOF`, jobname, namespace, jobname, image, cmdLine)
+
+	return &Command{
+		Name:           fmt.Sprintf("Run %s", jobname),
+		Cmd:            cmd,
+		ExpectedString: fmt.Sprintf("job.batch/%s created\n", jobname),
+	}
 }
 
 // PodCommand returns a Command that starts a pod with a specified image, command and args
@@ -544,7 +566,7 @@ EOF
 `, podname, namespace, podname, podname, image, cmdLine, commandArgsLine)
 
 	return &Command{
-		Name:           fmt.Sprintf("Run%s", podname),
+		Name:           fmt.Sprintf("Run %s", podname),
 		Cmd:            cmdStr,
 		ExpectedString: fmt.Sprintf("pod/%s created\n", podname),
 	}
@@ -566,7 +588,7 @@ func BusyboxPodCommand(namespace, cmd string) *Command {
 // namespace.
 // The returned value is: namespace_parameter-random_integer.
 func GenerateTestNamespaceName(namespace string) string {
-	return fmt.Sprintf("%s-%d", namespace, rand.Int())
+	return fmt.Sprintf("%s-%d", namespace, r.Int())
 }
 
 // CreateTestNamespaceCommand returns a Command which creates a namespace whom
@@ -616,6 +638,16 @@ func DeleteRemainingNamespacesCommand() *Command {
 	}
 }
 
+// WaitUntilJobCompleteCommand returns a Command which waits until the job with the specified name in
+// the given namespace is complete.
+func WaitUntilJobCompleteCommand(namespace string, jobname string) *Command {
+	return &Command{
+		Name:           fmt.Sprintf("WaitForJob: %s", jobname),
+		Cmd:            fmt.Sprintf("kubectl wait job --for condition=complete -n %s %s", namespace, jobname),
+		ExpectedString: fmt.Sprintf("job.batch/%s condition met\n", jobname),
+	}
+}
+
 // WaitUntilPodReadyCommand returns a Command which waits until pod with the specified name in
 // the given as parameter namespace is ready.
 func WaitUntilPodReadyCommand(namespace string, podname string) *Command {
@@ -626,10 +658,26 @@ func WaitUntilPodReadyCommand(namespace string, podname string) *Command {
 	}
 }
 
+// WaitUntilPodReadyOrOOMKilledCommand returns a Command which waits until pod with the specified name in
+// the given as parameter namespace is ready or was oomkilled.
+func WaitUntilPodReadyOrOOMKilledCommand(namespace string, podname string) *Command {
+	return &Command{
+		Name:           "WaitForTestPod",
+		Cmd:            fmt.Sprintf("kubectl wait pod --for condition=ready -n %s %s || kubectl wait pod --for jsonpath='{.status.containerStatuses[0].state.terminated.reason}'=OOMKilled -n %s %s", namespace, podname, namespace, podname),
+		ExpectedString: fmt.Sprintf("pod/%s condition met\n", podname),
+	}
+}
+
 // WaitUntilTestPodReadyCommand returns a Command which waits until test-pod in
 // the given as parameter namespace is ready.
 func WaitUntilTestPodReadyCommand(namespace string) *Command {
 	return WaitUntilPodReadyCommand(namespace, "test-pod")
+}
+
+// WaitUntilTestPodReadyOrOOMKilledCommand returns a Command which waits until test-pod in
+// the given as parameter namespace is ready or was oomkilled.
+func WaitUntilTestPodReadyOrOOMKilledCommand(namespace string) *Command {
+	return WaitUntilPodReadyOrOOMKilledCommand(namespace, "test-pod")
 }
 
 // SleepForSecondsCommand returns a Command which sleeps for given seconds

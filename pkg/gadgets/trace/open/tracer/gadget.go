@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package tracer is deprecated.
+//
+// Deprecated: Switch to image-based gadgets instead. Check
+// https://github.com/inspektor-gadget/inspektor-gadget/tree/main/examples/gadgets
 package tracer
 
 import (
@@ -24,9 +28,12 @@ import (
 
 const (
 	ParamFullPath = "full-path"
+	ParamPrefixes = "prefixes"
 )
 
-type GadgetDesc struct{}
+type GadgetDesc struct {
+	gadgets.GadgetDeprecated
+}
 
 func (g *GadgetDesc) Name() string {
 	return "open"
@@ -52,6 +59,11 @@ func (g *GadgetDesc) ParamDescs() params.ParamDescs {
 			Description:  "Show the absolute full path of the opened file",
 			DefaultValue: "false",
 			TypeHint:     params.TypeBool,
+		},
+		{
+			Key:          ParamPrefixes,
+			Description:  "Filter out by path prefixes. Join multiple prefixes with ','",
+			DefaultValue: "",
 		},
 	}
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package btfgen provides a way to load BTF information generated with btfgen. Files to be
-// incluided into the binary have to be generated with BTFGen (make btfgen on the root) before
+// included into the binary have to be generated with BTFGen (make btfgen on the root) before
 // compiling the binary.
 package btfgen
 
@@ -29,9 +29,10 @@ import (
 	"sync"
 
 	"github.com/cilium/ebpf/btf"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
 var (
@@ -46,7 +47,7 @@ func initialize() error {
 		return nil
 	}
 
-	info, err := getOSInfo()
+	info, err := GetOSInfo()
 	if err != nil {
 		return err
 	}
@@ -89,15 +90,15 @@ func GetBTFSpec() *btf.Spec {
 	return spec
 }
 
-type osInfo struct {
+type OsInfo struct {
 	ID        string
 	VersionID string
 	Arch      string
 	Kernel    string
 }
 
-func getOSInfo() (*osInfo, error) {
-	osInfo := &osInfo{}
+func GetOSInfo() (*OsInfo, error) {
+	osInfo := &OsInfo{}
 
 	file, err := os.Open(filepath.Join(host.HostRoot, "/etc/os-release"))
 	if err != nil {

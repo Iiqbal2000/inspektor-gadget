@@ -21,9 +21,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
+	"runtime"
 	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/stretchr/testify/require"
 
@@ -32,6 +37,11 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/trace/exec/types"
 	eventtypes "github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 )
+
+type execResult struct {
+	CatPid int
+	Ptid   int
+}
 
 func TestExecTracerCreate(t *testing.T) {
 	t.Parallel()
@@ -71,11 +81,16 @@ func TestExecTracer(t *testing.T) {
 	cwd, err := os.Getwd()
 	require.Nil(t, err, "Failed to get current working directory: %s", err)
 
+	executable, err := os.Executable()
+	require.Nil(t, err, "Failed to get executable path: %s", err)
+	pcomm := path.Base(executable)
+
 	type testDefinition struct {
+		shouldSkip      func(t *testing.T)
 		getTracerConfig func(info *utilstest.RunnerInfo) *tracer.Config
 		runnerConfig    *utilstest.RunnerConfig
-		generateEvent   func() (int, error)
-		validateEvent   func(t *testing.T, info *utilstest.RunnerInfo, catPid int, events []types.Event)
+		generateEvent   func() (execResult, error)
+		validateEvent   func(t *testing.T, info *utilstest.RunnerInfo, execResult execResult, events []types.Event)
 	}
 
 	loginuid := utilstest.ReadFileAsUint32(t, "/proc/self/loginuid")
@@ -87,19 +102,22 @@ func TestExecTracer(t *testing.T) {
 				return &tracer.Config{}
 			},
 			generateEvent: generateEvent,
-			validateEvent: utilstest.ExpectAtLeastOneEvent(func(info *utilstest.RunnerInfo, catPid int) *types.Event {
+			validateEvent: utilstest.ExpectAtLeastOneEvent(func(info *utilstest.RunnerInfo, execResult execResult) *types.Event {
 				return &types.Event{
 					Event: eventtypes.Event{
 						Type: eventtypes.NORMAL,
 					},
-					Pid:           uint32(catPid),
+					Pid:           uint32(execResult.CatPid),
+					Tid:           uint32(execResult.CatPid),
 					Ppid:          uint32(info.Pid),
+					Ptid:          uint32(execResult.Ptid),
 					Uid:           uint32(info.Uid),
 					LoginUid:      loginuid,
 					SessionId:     sessionid,
 					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
 					Retval:        0,
 					Comm:          "cat",
+					Pcomm:         pcomm,
 					Args:          []string{"/bin/cat", "/dev/null"},
 				}
 			}),
@@ -111,7 +129,7 @@ func TestExecTracer(t *testing.T) {
 				}
 			},
 			generateEvent: generateEvent,
-			validateEvent: utilstest.ExpectNoEvent[types.Event, int],
+			validateEvent: utilstest.ExpectNoEvent[types.Event, execResult],
 		},
 		"captures_events_with_matching_filter": {
 			getTracerConfig: func(info *utilstest.RunnerInfo) *tracer.Config {
@@ -120,19 +138,22 @@ func TestExecTracer(t *testing.T) {
 				}
 			},
 			generateEvent: generateEvent,
-			validateEvent: utilstest.ExpectOneEvent(func(info *utilstest.RunnerInfo, catPid int) *types.Event {
+			validateEvent: utilstest.ExpectOneEvent(func(info *utilstest.RunnerInfo, execResult execResult) *types.Event {
 				return &types.Event{
 					Event: eventtypes.Event{
 						Type: eventtypes.NORMAL,
 					},
-					Pid:           uint32(catPid),
+					Pid:           uint32(execResult.CatPid),
+					Tid:           uint32(execResult.CatPid),
 					Ppid:          uint32(info.Pid),
+					Ptid:          uint32(execResult.Ptid),
 					Uid:           uint32(info.Uid),
 					LoginUid:      loginuid,
 					SessionId:     sessionid,
 					WithMountNsID: eventtypes.WithMountNsID{MountNsID: info.MountNsID},
 					Retval:        0,
 					Comm:          "cat",
+					Pcomm:         pcomm,
 					Args:          []string{"/bin/cat", "/dev/null"},
 				}
 			}),
@@ -148,7 +169,7 @@ func TestExecTracer(t *testing.T) {
 				Gid: unprivilegedGID,
 			},
 			generateEvent: generateEvent,
-			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ int, events []types.Event) {
+			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ execResult, events []types.Event) {
 				require.Len(t, events, 1, "One event expected")
 				require.Equal(t, uint32(info.Uid), events[0].Uid, "Event has bad UID")
 				require.Equal(t, uint32(info.Gid), events[0].Gid, "Event has bad GID")
@@ -160,39 +181,64 @@ func TestExecTracer(t *testing.T) {
 					MountnsMap: utilstest.CreateMntNsFilterMap(t, info.MountNsID),
 				}
 			},
-			generateEvent: func() (int, error) {
+			generateEvent: func() (execResult, error) {
+				runtime.LockOSThread()
+				defer runtime.UnlockOSThread()
+
 				args := append(manyArgs, "/dev/null")
 				cmd := exec.Command("/bin/cat", args...)
 				if err := cmd.Run(); err != nil {
-					return 0, fmt.Errorf("running command: %w", err)
+					return execResult{
+						CatPid: 0,
+						Ptid:   0,
+					}, fmt.Errorf("running command: %w", err)
 				}
 
-				return cmd.Process.Pid, nil
+				ptid := unix.Gettid()
+
+				return execResult{
+					CatPid: cmd.Process.Pid,
+					Ptid:   ptid,
+				}, nil
 			},
-			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ int, events []types.Event) {
+			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ execResult, events []types.Event) {
 				require.Len(t, events, 1, "One event expected")
 				require.Equal(t, append([]string{"/bin/cat"}, manyArgs...), events[0].Args, "Event has bad args")
 			},
 		},
-		"event_has_correct_cwd": {
+		"event_has_correct_paths": {
 			getTracerConfig: func(info *utilstest.RunnerInfo) *tracer.Config {
 				return &tracer.Config{
 					MountnsMap: utilstest.CreateMntNsFilterMap(t, info.MountNsID),
-					GetCwd:     true,
+					GetPaths:   true,
 				}
 			},
-			generateEvent: func() (int, error) {
+			generateEvent: func() (execResult, error) {
+				runtime.LockOSThread()
+				defer runtime.UnlockOSThread()
+
 				args := append(manyArgs, "/dev/null")
 				cmd := exec.Command("/bin/cat", args...)
 				if err := cmd.Run(); err != nil {
-					return 0, fmt.Errorf("running command: %w", err)
+					return execResult{
+						CatPid: 0,
+						Ptid:   0,
+					}, fmt.Errorf("running command: %w", err)
 				}
 
-				return cmd.Process.Pid, nil
+				ptid := unix.Gettid()
+
+				return execResult{
+					CatPid: cmd.Process.Pid,
+					Ptid:   ptid,
+				}, nil
 			},
-			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ int, events []types.Event) {
+			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ execResult, events []types.Event) {
 				require.Len(t, events, 1, "One event expected")
 				require.Equal(t, events[0].Cwd, cwd, "Event has bad cwd")
+				// Depending on the Linux distribution, /bin can be a symlink to /usr/bin
+				exepath := strings.TrimPrefix(events[0].ExePath, "/usr")
+				require.Equal(t, exepath, "/bin/cat", "Event has bad exe path")
 			},
 		},
 		"event_failed": {
@@ -202,7 +248,7 @@ func TestExecTracer(t *testing.T) {
 				}
 			},
 			generateEvent: generateFailedEvent,
-			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ int, events []types.Event) {
+			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ execResult, events []types.Event) {
 				require.Len(t, events, 1, "One event expected")
 				require.Equal(t, []string{"/bin/foobar"}, events[0].Args, "Event has bad args")
 				require.NotEqual(t, int(0), events[0].Retval, "Event returns 0, while it should return an error code")
@@ -216,8 +262,58 @@ func TestExecTracer(t *testing.T) {
 				}
 			},
 			generateEvent: generateFailedEvent,
-			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ int, events []types.Event) {
+			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ execResult, events []types.Event) {
 				require.Len(t, events, 0, "Zero events expected")
+			},
+		},
+		"event_from_non_main_thread_success": {
+			shouldSkip: func(t *testing.T) {
+				if _, err := exec.LookPath("python3"); err != nil {
+					t.Skip("Python3 not found")
+				}
+			},
+			getTracerConfig: func(info *utilstest.RunnerInfo) *tracer.Config {
+				return &tracer.Config{
+					MountnsMap: utilstest.CreateMntNsFilterMap(t, info.MountNsID),
+				}
+			},
+			runnerConfig: &utilstest.RunnerConfig{
+				Uid: unprivilegedUID,
+				Gid: unprivilegedGID,
+			},
+			generateEvent: generateEventFromThread(true),
+			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ execResult, events []types.Event) {
+				// python + cat
+				require.Len(t, events, 2, "Two events expected")
+				require.Equal(t, "python3", events[0].Comm, "Event has bad comm")
+				require.Equal(t, 0, events[0].Retval, "Event has bad retval")
+				require.Equal(t, "cat", events[1].Comm, "Event has bad comm")
+				require.Equal(t, 0, events[1].Retval, "Event has bad retval")
+			},
+		},
+		"event_from_non_main_thread_fail": {
+			shouldSkip: func(t *testing.T) {
+				if _, err := exec.LookPath("python3"); err != nil {
+					t.Skip("Python3 not found")
+				}
+			},
+			getTracerConfig: func(info *utilstest.RunnerInfo) *tracer.Config {
+				return &tracer.Config{
+					MountnsMap: utilstest.CreateMntNsFilterMap(t, info.MountNsID),
+				}
+			},
+			runnerConfig: &utilstest.RunnerConfig{
+				Uid: unprivilegedUID,
+				Gid: unprivilegedGID,
+			},
+			generateEvent: generateEventFromThread(false),
+			validateEvent: func(t *testing.T, info *utilstest.RunnerInfo, _ execResult, events []types.Event) {
+				// python + cat
+				require.Len(t, events, 2, "Two events expected")
+				require.Equal(t, "python3", events[0].Comm, "Event has bad comm")
+				require.Equal(t, 0, events[0].Retval, "Event has bad retval")
+				require.Equal(t, "python3", events[1].Comm, "Event has bad comm")
+				require.Equal(t, -int(unix.ENOENT), events[1].Retval, "Event has bad retval")
 			},
 		},
 	} {
@@ -225,6 +321,10 @@ func TestExecTracer(t *testing.T) {
 
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+
+			if test.shouldSkip != nil {
+				test.shouldSkip(t)
+			}
 
 			events := []types.Event{}
 			eventCallback := func(event *types.Event) {
@@ -238,18 +338,18 @@ func TestExecTracer(t *testing.T) {
 
 			createTracer(t, test.getTracerConfig(runner.Info), eventCallback)
 
-			var catPid int
+			var result execResult
 
 			utilstest.RunWithRunner(t, runner, func() error {
 				var err error
-				catPid, err = test.generateEvent()
+				result, err = test.generateEvent()
 				return err
 			})
 
 			// Give some time for the tracer to capture the events
 			time.Sleep(100 * time.Millisecond)
 
-			test.validateEvent(t, runner.Info, catPid, events)
+			test.validateEvent(t, runner.Info, result, events)
 		})
 	}
 }
@@ -271,6 +371,7 @@ func TestExecTracerMultipleMntNsIDsFilter(t *testing.T) {
 	type expectedEvent struct {
 		mntNsID uint64
 		catPid  int
+		Ptid    int
 	}
 
 	const n int = 5
@@ -294,7 +395,10 @@ func TestExecTracerMultipleMntNsIDsFilter(t *testing.T) {
 	for i := 0; i < n; i++ {
 		utilstest.RunWithRunner(t, runners[i], func() error {
 			var err error
-			expectedEvents[i].catPid, err = generateEvent()
+			var result execResult
+			result, err = generateEvent()
+			expectedEvents[i].catPid, expectedEvents[i].Ptid = result.CatPid, result.Ptid
+
 			return err
 		})
 	}
@@ -338,19 +442,78 @@ func createTracer(
 
 // Function to generate an event used most of the times.
 // Returns pid of executed process.
-func generateEvent() (int, error) {
+func generateEvent() (execResult, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	cmd := exec.Command("/bin/cat", "/dev/null")
 	if err := cmd.Run(); err != nil {
-		return 0, fmt.Errorf("running command: %w", err)
+		return execResult{
+			CatPid: 0,
+			Ptid:   0,
+		}, fmt.Errorf("running command: %w", err)
 	}
 
-	return cmd.Process.Pid, nil
+	ptid := unix.Gettid()
+
+	return execResult{
+		CatPid: cmd.Process.Pid,
+		Ptid:   ptid,
+	}, nil
 }
 
 // Function to generate a failed event.
 // Return 0 as no process is created.
-func generateFailedEvent() (int, error) {
+func generateFailedEvent() (execResult, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	// Ignore error since we want to capture a failed event
 	exec.Command("/bin/foobar").Run()
-	return 0, nil
+	return execResult{
+		CatPid: 0,
+		Ptid:   0,
+	}, nil
+}
+
+// Function to generate an exec() event from a thread.
+func generateEventFromThread(success bool) func() (execResult, error) {
+	return func() (execResult, error) {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		bin := "/bin/cat"
+		if !success {
+			bin = "/bin/NONE"
+		}
+		script := fmt.Sprintf(`
+import threading
+import os
+
+def exec():
+    os.execve("%s", ["cat", "/dev/null"], {})
+
+def main():
+    thread = threading.Thread(target=exec)
+    thread.start()
+    thread.join()
+
+if __name__ == "__main__":
+    main()
+`, bin)
+		cmd := exec.Command("python3", "-c", script)
+		if err := cmd.Run(); err != nil {
+			return execResult{
+				CatPid: 0,
+				Ptid:   0,
+			}, fmt.Errorf("running command: %w", err)
+		}
+
+		ptid := unix.Gettid()
+
+		return execResult{
+			CatPid: cmd.Process.Pid,
+			Ptid:   ptid,
+		}, nil
+	}
 }

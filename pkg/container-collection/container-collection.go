@@ -313,7 +313,7 @@ func (cc *ContainerCollection) LookupPIDByContainer(namespace, pod, container st
 	cc.containers.Range(func(key, value interface{}) bool {
 		c := value.(*Container)
 		if namespace == c.K8s.Namespace && pod == c.K8s.PodName && container == c.K8s.ContainerName {
-			pid = c.Pid
+			pid = c.Runtime.ContainerPID
 			// container found, stop iterating
 			return false
 		}
@@ -330,7 +330,7 @@ func (cc *ContainerCollection) LookupPIDByPod(namespace, pod string) map[string]
 	cc.containers.Range(func(key, value interface{}) bool {
 		c := value.(*Container)
 		if namespace == c.K8s.Namespace && pod == c.K8s.PodName {
-			ret[c.K8s.ContainerName] = c.Pid
+			ret[c.K8s.ContainerName] = c.Runtime.ContainerPID
 		}
 		return true
 	})
@@ -424,6 +424,7 @@ func (cc *ContainerCollection) EnrichByMntNs(event *eventtypes.CommonData, mount
 	if container != nil {
 		event.K8s.ContainerName = container.K8s.ContainerName
 		event.K8s.PodName = container.K8s.PodName
+		event.K8s.PodLabels = container.K8s.PodLabels
 		event.K8s.Namespace = container.K8s.Namespace
 
 		event.Runtime.RuntimeName = container.Runtime.RuntimeName
@@ -452,6 +453,7 @@ func (cc *ContainerCollection) EnrichByNetNs(event *eventtypes.CommonData, netns
 	if len(containers) == 1 {
 		event.K8s.ContainerName = containers[0].K8s.ContainerName
 		event.K8s.PodName = containers[0].K8s.PodName
+		event.K8s.PodLabels = containers[0].K8s.PodLabels
 		event.K8s.Namespace = containers[0].K8s.Namespace
 
 		event.Runtime.RuntimeName = containers[0].Runtime.RuntimeName
@@ -464,6 +466,7 @@ func (cc *ContainerCollection) EnrichByNetNs(event *eventtypes.CommonData, netns
 	if containers[0].K8s.PodName != "" && containers[0].K8s.Namespace != "" {
 		// Kubernetes containers within the same pod.
 		event.K8s.PodName = containers[0].K8s.PodName
+		event.K8s.PodLabels = containers[0].K8s.PodLabels
 		event.K8s.Namespace = containers[0].K8s.Namespace
 
 		// All containers in the same pod share the same container runtime

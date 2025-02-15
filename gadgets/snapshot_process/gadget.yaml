@@ -1,0 +1,14 @@
+name: snapshot process
+description: Show running processes
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/snapshot_process
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/snapshot_process
+datasources:
+  processes:
+    fields:
+params:
+  ebpf:
+    show_threads:
+      key: threads
+      defaultValue: "false"
+      description: Show all threads (by default, only processes are shown)

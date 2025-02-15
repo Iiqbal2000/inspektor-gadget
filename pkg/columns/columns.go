@@ -1,4 +1,4 @@
-// Copyright 2022-2023 The Inspektor Gadget authors
+// Copyright 2022-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -475,6 +475,9 @@ func GetFieldFuncExt[OT any, T any](column ColumnInternals, raw bool) func(entry
 			start := unsafe.Pointer(entry)
 			if column.(*Column[T]).getStart != nil {
 				start = column.(*Column[T]).getStart(entry)
+				if start == nil {
+					return *new(OT)
+				}
 			}
 			// Previous note was outdated since we weren't using uintptr here
 			return *(*OT)(unsafe.Add(start, offset))
@@ -485,6 +488,9 @@ func GetFieldFuncExt[OT any, T any](column ColumnInternals, raw bool) func(entry
 		start := unsafe.Pointer(entry)
 		if column.(*Column[T]).getStart != nil {
 			start = column.(*Column[T]).getStart(entry)
+			if start == nil {
+				return *new(OT)
+			}
 		}
 		for i := 0; i < subLen-1; i++ {
 			if sub[i].isPtr {
@@ -565,7 +571,7 @@ func SetFieldFunc[OT any, T any](column ColumnInternals) func(entry *T, val OT) 
 	}
 }
 
-func GetFieldAsStringExt[T any](column ColumnInternals, floatFormat byte, floatPrecision int) func(entry *T) string {
+func GetFieldAsStringExt[T any](column ColumnInternals, floatFormat byte, floatPrecision int, hex bool) func(entry *T) string {
 	switch column.(*Column[T]).Kind() {
 	case reflect.Int,
 		reflect.Int8,
@@ -573,6 +579,11 @@ func GetFieldAsStringExt[T any](column ColumnInternals, floatFormat byte, floatP
 		reflect.Int32,
 		reflect.Int64:
 		ff := GetFieldAsNumberFunc[int64, T](column)
+		if hex {
+			return func(entry *T) string {
+				return "0x" + strings.ToUpper(strconv.FormatInt(ff(entry), 16))
+			}
+		}
 		return func(entry *T) string {
 			return strconv.FormatInt(ff(entry), 10)
 		}
@@ -582,11 +593,15 @@ func GetFieldAsStringExt[T any](column ColumnInternals, floatFormat byte, floatP
 		reflect.Uint32,
 		reflect.Uint64:
 		ff := GetFieldAsNumberFunc[uint64, T](column)
+		if hex {
+			return func(entry *T) string {
+				return "0x" + strings.ToUpper(strconv.FormatUint(ff(entry), 16))
+			}
+		}
 		return func(entry *T) string {
 			return strconv.FormatUint(ff(entry), 10)
 		}
-	case reflect.Float32,
-		reflect.Float64:
+	case reflect.Float32, reflect.Float64:
 		ff := GetFieldAsNumberFunc[float64, T](column)
 		return func(entry *T) string {
 			return strconv.FormatFloat(ff(entry), floatFormat, floatPrecision, 64)
@@ -616,11 +631,40 @@ func GetFieldAsStringExt[T any](column ColumnInternals, floatFormat byte, floatP
 		return func(entry *T) string {
 			return "TODO"
 		}
-	case reflect.String:
-		ff := GetFieldFunc[string, T](column)
-		return func(entry *T) string {
-			return ff(entry)
+	case reflect.Slice:
+		s := column.(*Column[T]).Type().Elem().Size()
+		if s == 1 {
+			ff := GetFieldFunc[[]byte, T](column)
+			return func(entry *T) string {
+				return string(ff(entry))
+			}
 		}
+
+		return func(entry *T) string {
+			return "TODO"
+		}
+	case reflect.Map:
+		keyType := column.(*Column[T]).Type().Key()
+		valueType := column.(*Column[T]).Type().Elem()
+
+		if keyType.Kind() == reflect.String && valueType.Kind() == reflect.String {
+			ff := GetFieldFunc[map[string]string, T](column)
+			return func(entry *T) string {
+				m := ff(entry)
+				kvPairs := make([]string, 0, len(m))
+				for k, v := range m {
+					kvPairs = append(kvPairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				sort.Strings(kvPairs)
+				return strings.Join(kvPairs, ",")
+			}
+		}
+
+		return func(entry *T) string {
+			return "TODO"
+		}
+	case reflect.String:
+		return GetFieldFunc[string, T](column)
 	}
 	return func(entry *T) string {
 		return ""
@@ -628,7 +672,7 @@ func GetFieldAsStringExt[T any](column ColumnInternals, floatFormat byte, floatP
 }
 
 func GetFieldAsString[T any](column ColumnInternals) func(entry *T) string {
-	return GetFieldAsStringExt[T](column, 'E', -1)
+	return GetFieldAsStringExt[T](column, 'E', -1, false)
 }
 
 // GetFieldAsNumberFunc returns a helper function to access a field of struct T as a number.

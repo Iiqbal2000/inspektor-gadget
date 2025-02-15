@@ -21,14 +21,19 @@ import (
 	"strings"
 	"time"
 
+	securejoin "github.com/cyphar/filepath-securejoin"
 	dockertypes "github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	dockerfilters "github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/cgroups"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/cri"
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
+	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
 const (
@@ -45,7 +50,24 @@ type DockerClient struct {
 	socketPath string
 }
 
-func NewDockerClient(socketPath string) (runtimeclient.ContainerRuntimeClient, error) {
+func NewDockerClient(socketPath string, protocol string) (runtimeclient.ContainerRuntimeClient, error) {
+	switch protocol {
+	// Empty string falls back to "internal". Used by unit tests.
+	case "", containerutilsTypes.RuntimeProtocolInternal:
+		// handled below
+
+	case containerutilsTypes.RuntimeProtocolCRI:
+		// TODO: Configurable
+		joinedSocketPath, err := securejoin.SecureJoin(host.HostRoot, runtimeclient.CriDockerDefaultSocketPath)
+		if err != nil {
+			return nil, fmt.Errorf("securejoining %v to %v: %w", host.HostRoot, runtimeclient.CriDockerDefaultSocketPath, err)
+		}
+		return cri.NewCRIClient(types.RuntimeNameDocker, joinedSocketPath, DefaultTimeout)
+
+	default:
+		return nil, fmt.Errorf("unknown runtime protocol %q", protocol)
+	}
+
 	if socketPath == "" {
 		socketPath = runtimeclient.DockerDefaultSocketPath
 	}
@@ -66,7 +88,7 @@ func NewDockerClient(socketPath string) (runtimeclient.ContainerRuntimeClient, e
 }
 
 func listContainers(c *DockerClient, filter *dockerfilters.Args) ([]dockertypes.Container, error) {
-	opts := dockertypes.ContainerListOptions{
+	opts := container.ListOptions{
 		// We need to request for all containers (also non-running) because
 		// when we are enriching a container that is being created, it is
 		// not in "running" state yet.
@@ -159,20 +181,18 @@ func (c *DockerClient) GetContainerDetails(containerID string) (*runtimeclient.C
 		return nil, errors.New("container host config is nil")
 	}
 
+	containerData := buildContainerData(
+		containerJSON.ID,
+		containerJSON.Name,
+		containerJSON.Config.Image,
+		c.getContainerImageDigest(containerJSON.Image),
+		containerJSON.State.Status,
+		containerJSON.Config.Labels)
+
 	containerDetailsData := runtimeclient.ContainerDetailsData{
-		ContainerData: runtimeclient.ContainerData{
-			Runtime: runtimeclient.RuntimeContainerData{
-				BasicRuntimeMetadata: types.BasicRuntimeMetadata{
-					ContainerID:        containerJSON.ID,
-					ContainerName:      strings.TrimPrefix(containerJSON.Name, "/"),
-					RuntimeName:        types.RuntimeNameDocker,
-					ContainerImageName: getContainerImageNamefromImage(containerJSON.Config.Image, containerJSON.ID),
-				},
-				State: containerStatusStateToRuntimeClientState(containerJSON.State.Status),
-			},
-		},
-		Pid:         containerJSON.State.Pid,
-		CgroupsPath: string(containerJSON.HostConfig.Cgroup),
+		ContainerData: *containerData,
+		Pid:           containerJSON.State.Pid,
+		CgroupsPath:   string(containerJSON.HostConfig.Cgroup),
 	}
 	if len(containerJSON.Mounts) > 0 {
 		containerDetailsData.Mounts = make([]runtimeclient.ContainerMountData, len(containerJSON.Mounts))
@@ -183,9 +203,6 @@ func (c *DockerClient) GetContainerDetails(containerID string) (*runtimeclient.C
 			}
 		}
 	}
-
-	// Fill K8S information.
-	runtimeclient.EnrichWithK8sMetadata(&containerDetailsData.ContainerData, containerJSON.Config.Labels)
 
 	// Try to get cgroups information from /proc/<pid>/cgroup as a fallback.
 	// However, don't fail if such a file is not available, as it would prevent the
@@ -219,6 +236,30 @@ func (c *DockerClient) Close() error {
 	return nil
 }
 
+// Gets the image digest for the given image ID, if the digest exists.
+// The digest is usually only available if the image was either pulled from a registry, or if the image was pushed to a registry, which is when the manifest is generated and its digest calculated.
+// Note: This function only works for already running containers and not for containers that are being created.
+func (c *DockerClient) getContainerImageDigest(imageId string) string {
+	imageInspect, _, err := c.client.ImageInspectWithRaw(context.Background(), imageId)
+	if err != nil {
+		log.Warnf("Failed to get image digest for image %s: %s", imageId, err)
+		return ""
+	}
+
+	if len(imageInspect.RepoDigests) == 0 {
+		log.Warnf("No digest found for image %s", imageId)
+		return ""
+	}
+
+	imageAndDigest := strings.Split(imageInspect.RepoDigests[0], "@")
+	if len(imageAndDigest) < 2 {
+		log.Warnf("Digest is in wrong format for image %s", imageId)
+		return ""
+	}
+
+	return imageAndDigest[1]
+}
+
 // Convert the state from container status to state of runtime client.
 func containerStatusStateToRuntimeClientState(containerState string) (runtimeClientState string) {
 	switch containerState {
@@ -237,27 +278,19 @@ func containerStatusStateToRuntimeClientState(containerState string) (runtimeCli
 }
 
 func DockerContainerToContainerData(container *dockertypes.Container) *runtimeclient.ContainerData {
-	containerData := &runtimeclient.ContainerData{
-		Runtime: runtimeclient.RuntimeContainerData{
-			BasicRuntimeMetadata: types.BasicRuntimeMetadata{
-				ContainerID:        container.ID,
-				ContainerName:      strings.TrimPrefix(container.Names[0], "/"),
-				RuntimeName:        types.RuntimeNameDocker,
-				ContainerImageName: getContainerImageNamefromImage(container.Image, container.ID),
-			},
-			State: containerStatusStateToRuntimeClientState(container.State),
-		},
-	}
-
-	// Fill K8S information.
-	runtimeclient.EnrichWithK8sMetadata(containerData, container.Labels)
-
-	return containerData
+	imageDigest := ""
+	return buildContainerData(
+		container.ID,
+		container.Names[0],
+		container.Image,
+		imageDigest,
+		container.State,
+		container.Labels)
 }
 
 // getContainerImageNamefromImage is a helper to parse the image string we get from Docker API
 // and retrieve the image name if provided.
-func getContainerImageNamefromImage(image string, containerID string) string {
+func getContainerImageNamefromImage(image string) string {
 	// Image filed provided by Docker API may looks like e.g.
 	// 1. gcr.io/k8s-minikube/kicbase:v0.0.37@sha256:8bf7a0e8a062bc5e2b71d28b35bfa9cc862d9220e234e86176b3785f685d8b15
 	// OR
@@ -277,4 +310,25 @@ func getContainerImageNamefromImage(image string, containerID string) string {
 
 	// Case 3 or 4
 	return image
+}
+
+// `buildContainerData` takes in basic metadata about a Docker container and
+// constructs a `runtimeclient.ContainerData` struct with this information. I also
+// enriches containers with the data and returns a pointer the created struct.
+func buildContainerData(containerID string, containerName string, containerImage string, containerImageDigest string, state string, labels map[string]string) *runtimeclient.ContainerData {
+	containerData := runtimeclient.ContainerData{
+		Runtime: runtimeclient.RuntimeContainerData{
+			ContainerID:          containerID,
+			ContainerName:        strings.TrimPrefix(containerName, "/"),
+			RuntimeName:          types.RuntimeNameDocker,
+			ContainerImageName:   getContainerImageNamefromImage(containerImage),
+			ContainerImageDigest: containerImageDigest,
+			State:                containerStatusStateToRuntimeClientState(state),
+		},
+	}
+
+	// Fill K8S information.
+	runtimeclient.EnrichWithK8sMetadata(&containerData, labels)
+
+	return &containerData
 }

@@ -1,4 +1,4 @@
-// Copyright 2022-2023 The Inspektor Gadget authors
+// Copyright 2022-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,21 +25,25 @@ import (
 type TypeHint string
 
 const (
-	TypeBool     TypeHint = "bool"
-	TypeString   TypeHint = "string"
-	TypeBytes    TypeHint = "bytes"
-	TypeInt      TypeHint = "int"
-	TypeInt8     TypeHint = "int8"
-	TypeInt16    TypeHint = "int16"
-	TypeInt32    TypeHint = "int32"
-	TypeInt64    TypeHint = "int64"
-	TypeUint     TypeHint = "uint"
-	TypeUint8    TypeHint = "uint8"
-	TypeUint16   TypeHint = "uint16"
-	TypeUint32   TypeHint = "uint32"
-	TypeUint64   TypeHint = "uint64"
-	TypeDuration TypeHint = "duration"
-	TypeIP       TypeHint = "ip"
+	TypeUnknown     TypeHint = ""
+	TypeBool        TypeHint = "bool"
+	TypeString      TypeHint = "string"
+	TypeBytes       TypeHint = "bytes"
+	TypeInt         TypeHint = "int"
+	TypeInt8        TypeHint = "int8"
+	TypeInt16       TypeHint = "int16"
+	TypeInt32       TypeHint = "int32"
+	TypeInt64       TypeHint = "int64"
+	TypeUint        TypeHint = "uint"
+	TypeUint8       TypeHint = "uint8"
+	TypeUint16      TypeHint = "uint16"
+	TypeUint32      TypeHint = "uint32"
+	TypeUint64      TypeHint = "uint64"
+	TypeFloat32     TypeHint = "float32"
+	TypeFloat64     TypeHint = "float64"
+	TypeDuration    TypeHint = "duration"
+	TypeIP          TypeHint = "ip"
+	TypeStringSlice TypeHint = "[]string"
 )
 
 var typeHintValidators = map[TypeHint]ParamValidator{
@@ -54,6 +58,8 @@ var typeHintValidators = map[TypeHint]ParamValidator{
 	TypeUint16:   ValidateUint(16),
 	TypeUint32:   ValidateUint(32),
 	TypeUint64:   ValidateUint(64),
+	TypeFloat32:  ValidateFloat(32),
+	TypeFloat64:  ValidateFloat(64),
 	TypeDuration: ValidateDuration,
 	TypeIP:       ValidateIP,
 }
@@ -75,6 +81,16 @@ func ValidateInt(bitsize int) func(string) error {
 func ValidateUint(bitsize int) func(string) error {
 	return func(value string) error {
 		_, err := strconv.ParseUint(value, 10, bitsize)
+		if err != nil {
+			return fmt.Errorf("expected numeric value: %w", err)
+		}
+		return nil
+	}
+}
+
+func ValidateFloat(bitsize int) func(string) error {
+	return func(value string) error {
+		_, err := strconv.ParseFloat(value, bitsize)
 		if err != nil {
 			return fmt.Errorf("expected numeric value: %w", err)
 		}

@@ -1,0 +1,54 @@
+name: trace mount
+description: trace mount syscalls
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_mount
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_mount
+datasources:
+  mount:
+    fields:
+      delta_raw:
+        annotations:
+          columns.width: 8
+          columns.alignment: right
+      error_raw:
+        annotations:
+          columns.hidden: true
+      error:
+        annotations:
+          description: return value
+      fs:
+        annotations:
+          columns.width: 8
+          columns.hidden: true
+      src:
+        annotations:
+          columns.width: 32
+          columns.minwidth: 24
+          columns.hidden: true
+      dest:
+        annotations:
+          columns.width: 32
+          columns.minwidth: 24
+          columns.hidden: true
+      data:
+        annotations:
+          columns.width: 32
+          columns.minwidth: 24
+          columns.hidden: true
+      op_raw:
+        annotations:
+          columns.hidden: true
+      op:
+        annotations:
+          columns.width: 6
+          columns.minwidth: 6
+          columns.hidden: true
+      flags_raw:
+        annotations:
+          columns.hidden: true
+      flags:
+        annotations:
+          description: mount flags
+      call:
+        annotations:
+          columns.width: 32

@@ -3,44 +3,80 @@
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
-#ifdef __TARGET_ARCH_arm64
-#include <bpf/bpf_tracing.h>
-#endif /* __TARGET_ARCH_arm64 */
 
-#include <gadget/mntns_filter.h>
+#define GADGET_NO_BUF_RESERVE
+#include <gadget/buffer.h>
+#include <gadget/common.h>
+#include <gadget/filter.h>
+#include <gadget/macros.h>
 #include <gadget/types.h>
+#include <gadget/filesystem.h>
 
-#define ARGSIZE 128
-#define TOTAL_MAX_ARGS 60
-#define DEFAULT_MAXARGS 20
+// Defined in include/uapi/linux/magic.h
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630
+
+#define ARGSIZE 256
+#define TOTAL_MAX_ARGS 20
+
+// Keep in sync with fullMaxArgsArr in program.go
 #define FULL_MAX_ARGS_ARR (TOTAL_MAX_ARGS * ARGSIZE)
-#define INVALID_UID ((uid_t)-1)
+
 #define BASE_EVENT_SIZE (size_t)(&((struct event *)0)->args)
 #define EVENT_SIZE(e) (BASE_EVENT_SIZE + e->args_size)
 #define LAST_ARG (FULL_MAX_ARGS_ARR - ARGSIZE)
 
+// Macros from https://github.com/torvalds/linux/blob/v6.12/include/linux/kdev_t.h#L7-L12
+#define MINORBITS 20
+#define MINORMASK ((1U << MINORBITS) - 1)
+#define MAJOR(dev) ((unsigned int)((dev) >> MINORBITS))
+#define MINOR(dev) ((unsigned int)((dev) & MINORMASK))
+#define MKDEV(ma, mi) (((ma) << MINORBITS) | (mi))
+
 struct event {
-	mnt_ns_id_t mntns_id;
-	__u64 timestamp;
-	__u32 pid;
-	__u32 ppid;
-	__u32 uid;
-	__u32 gid;
-	__u32 loginuid;
+	gadget_timestamp timestamp_raw;
+	struct gadget_process proc;
+
+	gadget_uid loginuid;
 	__u32 sessionid;
-	int retval;
+	gadget_errno error_raw;
 	int args_count;
+	bool upper_layer;
+	bool fupper_layer;
+	bool pupper_layer;
 	unsigned int args_size;
-	__u8 comm[TASK_COMM_LEN];
-	__u8 args[FULL_MAX_ARGS_ARR];
+	char cwd[MAX_STRING_SIZE];
+	char file[MAX_STRING_SIZE];
+	unsigned int dev_major;
+	unsigned int dev_minor;
+	unsigned long inode;
+	char exepath[MAX_STRING_SIZE];
+	char args[FULL_MAX_ARGS_ARR];
 };
 
 const volatile bool ignore_failed = true;
-const volatile uid_t targ_uid = INVALID_UID;
-const volatile int max_args = DEFAULT_MAXARGS;
+const volatile bool paths = false;
+
+GADGET_PARAM(ignore_failed);
+GADGET_PARAM(paths);
 
 static const struct event empty_event = {};
 
+// man clone(2):
+//   If any of the threads in a thread group performs an
+//   execve(2), then all threads other than the thread group
+//   leader are terminated, and the new program is executed in
+//   the thread group leader.
+//
+// sys_enter_execve might be called from a thread and the corresponding
+// sys_exit_execve will be called from the thread group leader in case of
+// execve success, or from the same thread in case of execve failure.
+//
+// Moreover, checking ctx->ret == 0 is not a reliable way to distinguish
+// successful execve from failed execve because seccomp can change ctx->ret.
+//
+// Therefore, use two different tracepoints to handle the map cleanup:
+// - tracepoint/sched/sched_process_exec is called after a successful execve
+// - tracepoint/syscalls/sys_exit_execve is always called
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 10240);
@@ -49,45 +85,31 @@ struct {
 } execs SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-	__uint(key_size, sizeof(u32));
-	//__uint(value_size, sizeof(u32));
-	__type(value, struct event);
-} print_events SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 10240);
+	__type(key, pid_t);
+	__type(value, __u8);
+} security_bprm_hit_map SEC(".maps");
 
-static __always_inline bool valid_uid(uid_t uid)
-{
-	return uid != INVALID_UID;
-}
+GADGET_TRACER_MAP(events, 1024 * 256);
 
-SEC("tracepoint/syscalls/sys_enter_execve")
-int ig_execve_e(struct trace_event_raw_sys_enter *ctx)
+GADGET_TRACER(exec, events, event);
+
+static __always_inline int enter_execve(const char *pathname, const char **args)
 {
 	u64 id;
-	pid_t pid, tgid;
+	pid_t pid;
 	struct event *event;
 	struct task_struct *task;
 	unsigned int ret;
-	const char **args = (const char **)(ctx->args[1]);
 	const char *argp;
 	int i;
-	u64 mntns_id;
-	u64 uid_gid = bpf_get_current_uid_gid();
-	u32 uid = (u32)uid_gid;
-	u32 gid = (u32)(uid_gid >> 32);
 
-	if (valid_uid(targ_uid) && targ_uid != uid)
-		return 0;
-
-	task = (struct task_struct *)bpf_get_current_task();
-	mntns_id = (u64)BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
-
-	if (gadget_should_discard_mntns_id(mntns_id))
+	if (gadget_should_discard_data_current())
 		return 0;
 
 	id = bpf_get_current_pid_tgid();
 	pid = (pid_t)id;
-	tgid = id >> 32;
 	if (bpf_map_update_elem(&execs, &pid, &empty_event, BPF_NOEXIST))
 		return 0;
 
@@ -95,19 +117,29 @@ int ig_execve_e(struct trace_event_raw_sys_enter *ctx)
 	if (!event)
 		return 0;
 
-	event->timestamp = bpf_ktime_get_boot_ns();
-	event->pid = tgid;
-	event->uid = uid;
-	event->gid = gid;
-	event->loginuid = BPF_CORE_READ(task, loginuid.val);
-	event->sessionid = BPF_CORE_READ(task, sessionid);
-	event->ppid = (pid_t)BPF_CORE_READ(task, real_parent, tgid);
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
+	task = (struct task_struct *)bpf_get_current_task();
+
+	// loginuid is only available when CONFIG_AUDIT is set
+	if (bpf_core_field_exists(task->loginuid))
+		event->loginuid = BPF_CORE_READ(task, loginuid.val);
+	else
+		event->loginuid = 4294967295; // -1 or "no user id"
+
+	// sessionid is only available when CONFIG_AUDIT is set
+	if (bpf_core_field_exists(task->sessionid))
+		event->sessionid = BPF_CORE_READ(task, sessionid);
+
 	event->args_count = 0;
 	event->args_size = 0;
-	event->mntns_id = mntns_id;
 
-	ret = bpf_probe_read_user_str(event->args, ARGSIZE,
-				      (const char *)ctx->args[0]);
+	if (paths) {
+		struct fs_struct *fs = BPF_CORE_READ(task, fs);
+		char *cwd = get_path_str(&fs->pwd);
+		bpf_probe_read_kernel_str(event->cwd, MAX_STRING_SIZE, cwd);
+	}
+
+	ret = bpf_probe_read_user_str(event->args, ARGSIZE, pathname);
 	if (ret <= ARGSIZE) {
 		event->args_size += ret;
 	} else {
@@ -118,7 +150,7 @@ int ig_execve_e(struct trace_event_raw_sys_enter *ctx)
 
 	event->args_count++;
 #pragma unroll
-	for (i = 1; i < TOTAL_MAX_ARGS && i < max_args; i++) {
+	for (i = 1; i < TOTAL_MAX_ARGS; i++) {
 		bpf_probe_read_user(&argp, sizeof(argp), &args[i]);
 		if (!argp)
 			return 0;
@@ -135,52 +167,185 @@ int ig_execve_e(struct trace_event_raw_sys_enter *ctx)
 		event->args_size += ret;
 	}
 	/* try to read one more argument to check if there is one */
-	bpf_probe_read_user(&argp, sizeof(argp), &args[max_args]);
+	bpf_probe_read_user(&argp, sizeof(argp), &args[TOTAL_MAX_ARGS]);
 	if (!argp)
 		return 0;
 
-	/* pointer to max_args+1 isn't null, asume we have more arguments */
+	/* pointer to max_args+1 isn't null, assume we have more arguments */
 	event->args_count++;
 	return 0;
 }
 
-#ifdef __TARGET_ARCH_arm64
-SEC("kretprobe/do_execveat_common.isra.0")
-int BPF_KRETPROBE(ig_execveat_x)
-#else /* !__TARGET_ARCH_arm64 */
-SEC("tracepoint/syscalls/sys_exit_execve")
-int ig_execve_x(struct trace_event_raw_sys_exit *ctx)
-#endif /* !__TARGET_ARCH_arm64 */
+SEC("tracepoint/syscalls/sys_enter_execve")
+int ig_execve_e(struct syscall_trace_enter *ctx)
 {
-	u64 id;
-	pid_t pid;
-	int ret;
-	struct event *event;
-	u32 uid = (u32)bpf_get_current_uid_gid();
+	const char *pathname = (const char *)ctx->args[0];
+	const char **args = (const char **)(ctx->args[1]);
+	return enter_execve(pathname, args);
+}
 
-	if (valid_uid(targ_uid) && targ_uid != uid)
+SEC("tracepoint/syscalls/sys_enter_execveat")
+int ig_execveat_e(struct syscall_trace_enter *ctx)
+{
+	const char *pathname = (const char *)ctx->args[1];
+	const char **args = (const char **)(ctx->args[2]);
+	return enter_execve(pathname, args);
+}
+
+static __always_inline bool has_upper_layer(struct inode *inode)
+{
+	unsigned long sb_magic = BPF_CORE_READ(inode, i_sb, s_magic);
+
+	if (sb_magic != OVERLAYFS_SUPER_MAGIC) {
+		return false;
+	}
+
+	struct dentry *upperdentry;
+
+	// struct ovl_inode defined in fs/overlayfs/ovl_entry.h
+	// Unfortunately, not exported to vmlinux.h
+	// and not available in /sys/kernel/btf/vmlinux
+	// See https://github.com/cilium/ebpf/pull/1300
+	// We only rely on vfs_inode and __upperdentry relative positions
+	bpf_probe_read_kernel(&upperdentry, sizeof upperdentry,
+			      ((void *)inode) +
+				      bpf_core_type_size(struct inode));
+
+	return upperdentry != NULL;
+}
+
+// tracepoint/sched/sched_process_exec is called after a successful execve
+SEC("tracepoint/sched/sched_process_exec")
+int ig_sched_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+	u32 pre_sched_pid = ctx->old_pid;
+	struct event *event;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+
+	event = bpf_map_lookup_elem(&execs, &pre_sched_pid);
+	if (!event)
 		return 0;
-	id = bpf_get_current_pid_tgid();
-	pid = (pid_t)id;
+
+	struct inode *inode = BPF_CORE_READ(task, mm, exe_file, f_inode);
+	if (inode)
+		event->upper_layer = has_upper_layer(inode);
+
+	struct inode *pinode = BPF_CORE_READ(parent, mm, exe_file, f_inode);
+	if (pinode)
+		event->pupper_layer = has_upper_layer(pinode);
+
+	gadget_process_populate(&event->proc);
+	event->error_raw = 0;
+
+	if (paths) {
+		struct file *exe_file = BPF_CORE_READ(task, mm, exe_file);
+		char *exepath = get_path_str(&exe_file->f_path);
+		bpf_probe_read_kernel_str(event->exepath, MAX_STRING_SIZE,
+					  exepath);
+	}
+
+	size_t len = EVENT_SIZE(event);
+	if (len <= sizeof(*event))
+		gadget_output_buf(ctx, &events, event, len);
+
+	bpf_map_delete_elem(&execs, &pre_sched_pid);
+	bpf_map_delete_elem(&security_bprm_hit_map, &pre_sched_pid);
+
+	return 0;
+}
+
+static __always_inline int exit_execve(void *ctx, int retval)
+{
+	u32 pid = (u32)bpf_get_current_pid_tgid();
+	struct event *event;
+
+	// If the execve was successful, sched/sched_process_exec handled the event
+	// already and deleted the entry. So if we find the entry, it means the
+	// the execve failed.
 	event = bpf_map_lookup_elem(&execs, &pid);
 	if (!event)
 		return 0;
-#ifdef __TARGET_ARCH_arm64
-	ret = PT_REGS_RC(ctx);
-#else /* !__TARGET_ARCH_arm64 */
-	ret = ctx->ret;
-#endif /* !__TARGET_ARCH_arm64 */
-	if (ignore_failed && ret < 0)
+
+	if (ignore_failed)
 		goto cleanup;
 
-	event->retval = ret;
-	bpf_get_current_comm(&event->comm, sizeof(event->comm));
+	gadget_process_populate(&event->proc);
+	event->error_raw = -retval;
+
+	if (paths) {
+		struct task_struct *task =
+			(struct task_struct *)bpf_get_current_task();
+		struct file *exe_file = BPF_CORE_READ(task, mm, exe_file);
+		char *exepath = get_path_str(&exe_file->f_path);
+		bpf_probe_read_kernel_str(event->exepath, MAX_STRING_SIZE,
+					  exepath);
+	}
+
 	size_t len = EVENT_SIZE(event);
 	if (len <= sizeof(*event))
-		bpf_perf_event_output(ctx, &print_events, BPF_F_CURRENT_CPU,
-				      event, len);
+		gadget_output_buf(ctx, &events, event, len);
 cleanup:
 	bpf_map_delete_elem(&execs, &pid);
+	bpf_map_delete_elem(&security_bprm_hit_map, &pid);
+	return 0;
+}
+
+// We use syscalls/sys_exit_execve only to trace failed execve
+// This program is needed regardless of ignore_failed
+SEC("tracepoint/syscalls/sys_exit_execve")
+int ig_execve_x(struct syscall_trace_exit *ctx)
+{
+	return exit_execve(ctx, ctx->ret);
+}
+
+SEC("tracepoint/syscalls/sys_exit_execveat")
+int ig_execveat_x(struct syscall_trace_exit *ctx)
+{
+	return exit_execve(ctx, ctx->ret);
+}
+
+SEC("kprobe/security_bprm_check")
+int BPF_KPROBE(security_bprm_check, struct linux_binprm *bprm)
+{
+	u32 pid = (u32)bpf_get_current_pid_tgid();
+	struct event *event;
+	char *file;
+	dev_t dev_no;
+	struct path f_path;
+
+	event = bpf_map_lookup_elem(&execs, &pid);
+	if (!event)
+		return 0;
+
+	// security_bprm_check is called repeatedly following the shebang
+	// Only get the first call.
+	__u8 *exists = bpf_map_lookup_elem(&security_bprm_hit_map, &pid);
+	if (exists) {
+		return 0;
+	}
+
+	__u8 hit = 1;
+	if (bpf_map_update_elem(&security_bprm_hit_map, &pid, &hit,
+				BPF_NOEXIST)) {
+		return 0;
+	}
+
+	struct inode *inode = BPF_CORE_READ(bprm, file, f_inode);
+	if (inode)
+		event->fupper_layer = has_upper_layer(inode);
+
+	if (paths) {
+		f_path = BPF_CORE_READ(bprm, file, f_path);
+		file = get_path_str(&f_path);
+		bpf_probe_read_kernel_str(event->file, MAX_STRING_SIZE, file);
+
+		dev_no = BPF_CORE_READ(inode, i_sb, s_dev);
+		event->dev_major = MAJOR(dev_no);
+		event->dev_minor = MINOR(dev_no);
+		event->inode = BPF_CORE_READ(inode, i_ino);
+	}
+
 	return 0;
 }
 

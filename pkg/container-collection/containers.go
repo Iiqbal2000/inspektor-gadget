@@ -1,4 +1,4 @@
-// Copyright 2022 The Inspektor Gadget authors
+// Copyright 2022-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,9 +38,6 @@ type Container struct {
 	// K8s contains the Kubernetes metadata of the container.
 	K8s K8sMetadata `json:"k8s,omitempty" column:"k8s" columnTags:"kubernetes"`
 
-	// Pid is the process id of the container
-	Pid uint32 `json:"pid,omitempty" column:"pid,template:pid,hide"`
-
 	// Container's configuration is the config.json from the OCI runtime
 	// spec
 	OciConfig *ocispec.Spec `json:"ociConfig,omitempty"`
@@ -49,6 +46,9 @@ type Container struct {
 	// runtime spec
 	// See https://github.com/opencontainers/runtime-spec/blob/main/bundle.md
 	Bundle string `json:"bundle,omitempty"`
+
+	// SandboxId is the sandbox id for the corresponding pod
+	SandboxId string `json:"sandboxId,omitempty"`
 
 	// Linux metadata can be derived from the pid via /proc/$pid/...
 	Mntns       uint64 `json:"mntns,omitempty" column:"mntns,template:ns"`
@@ -91,15 +91,13 @@ type RuntimeMetadata struct {
 
 type K8sMetadata struct {
 	types.BasicK8sMetadata `json:",inline"`
-	PodLabels              map[string]string `json:"podLabels,omitempty"`
-	PodUID                 string            `json:"podUID,omitempty"`
+	PodUID                 string `json:"podUID,omitempty"`
 
 	ownerReference *metav1.OwnerReference
 }
 
 type K8sSelector struct {
 	types.BasicK8sMetadata
-	PodLabels map[string]string
 }
 
 type RuntimeSelector struct {
@@ -212,4 +210,30 @@ func GetColumns() *columns.Columns[Container] {
 	})
 
 	return cols
+}
+
+func (c *Container) K8sMetadata() *types.BasicK8sMetadata {
+	return &c.K8s.BasicK8sMetadata
+}
+
+func (c *Container) RuntimeMetadata() *types.BasicRuntimeMetadata {
+	return &c.Runtime.BasicRuntimeMetadata
+}
+
+func (c *Container) UsesHostNetwork() bool {
+	return c.HostNetwork
+}
+
+func (c *Container) ContainerPid() uint32 {
+	return c.Runtime.ContainerPID
+}
+
+func (c *Container) K8sOwnerReference() *types.K8sOwnerReference {
+	if c.K8s.ownerReference == nil {
+		return &types.K8sOwnerReference{}
+	}
+	return &types.K8sOwnerReference{
+		Kind: c.K8s.ownerReference.Kind,
+		Name: c.K8s.ownerReference.Name,
+	}
 }

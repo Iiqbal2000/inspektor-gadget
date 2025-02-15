@@ -1,4 +1,4 @@
-// Copyright 2019-2023 The Inspektor Gadget authors
+// Copyright 2019-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package types
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/columns"
@@ -33,8 +34,10 @@ func init() {
 	columns.MustRegisterTemplate("namespace", "width:30")
 	columns.MustRegisterTemplate("pod", "width:30,ellipsis:middle")
 	columns.MustRegisterTemplate("container", "width:30")
+	columns.MustRegisterTemplate("containerPid", "width:6,hide")
 	columns.MustRegisterTemplate("containerImageName", "width:30")
 	columns.MustRegisterTemplate("containerImageDigest", "width:30")
+	columns.MustRegisterTemplate("containerStartedAt", "width:35,hide")
 	columns.MustRegisterTemplate("comm", "maxWidth:16")
 	columns.MustRegisterTemplate("pid", "minWidth:7")
 	columns.MustRegisterTemplate("uid", "minWidth:8")
@@ -105,6 +108,14 @@ func String2RuntimeName(name string) RuntimeName {
 	return RuntimeNameUnknown
 }
 
+type Container interface {
+	K8sMetadata() *BasicK8sMetadata
+	RuntimeMetadata() *BasicRuntimeMetadata
+	UsesHostNetwork() bool
+	K8sOwnerReference() *K8sOwnerReference
+	ContainerPid() uint32
+}
+
 type BasicRuntimeMetadata struct {
 	// RuntimeName is the name of the container runtime. It is useful to distinguish
 	// who is the "owner" of each container in a list of containers collected
@@ -119,6 +130,9 @@ type BasicRuntimeMetadata struct {
 	// response with multiple containers, ContainerName contains only the first element.
 	ContainerName string `json:"containerName,omitempty" column:"containerName,template:container"`
 
+	// ContainerPID is the process ID of the first process in the container.
+	ContainerPID uint32 `json:"containerPid,omitempty" column:"containerPid,template:containerPid"`
+
 	// ContainerImageName is the name of the container image where the event comes from
 	// i.e. docker.io/library/busybox:latest
 	// Sometimes the image name is not provided by the runtime (i.e. Docker), then ContainerImageName
@@ -129,8 +143,12 @@ type BasicRuntimeMetadata struct {
 	ContainerImageName string `json:"containerImageName,omitempty" column:"containerImageName,hide"`
 
 	// ContainerImageDigest is the (repo) digest of the container image where the event comes from
-	// Only events of initial containers (cri-o and containerd) are enriched with image digest
+	// containerd: events from both initial and new containers are enriched
+	// crio: events from initial containers are enriched
 	ContainerImageDigest string `json:"containerImageDigest,omitempty" column:"containerImageDigest,hide"`
+
+	// ContainerStartedAt is the unix timestamp at which the container was started at
+	ContainerStartedAt Time `json:"containerStartedAt,omitempty" column:"containerStartedAt,template:timestamp,stringer,hide"`
 }
 
 func (b *BasicRuntimeMetadata) IsEnriched() bool {
@@ -138,13 +156,19 @@ func (b *BasicRuntimeMetadata) IsEnriched() bool {
 }
 
 type BasicK8sMetadata struct {
-	Namespace     string `json:"namespace,omitempty" column:"namespace,template:namespace"`
-	PodName       string `json:"podName,omitempty" column:"pod,template:pod"`
-	ContainerName string `json:"containerName,omitempty" column:"container,template:container"`
+	Namespace     string            `json:"namespace,omitempty" column:"namespace,template:namespace"`
+	PodName       string            `json:"podName,omitempty" column:"podName,template:pod"`
+	PodLabels     map[string]string `json:"podLabels,omitempty" column:"labels,hide"`
+	ContainerName string            `json:"containerName,omitempty" column:"containerName,template:container"`
+}
+
+type K8sOwnerReference struct {
+	Kind string `json:"kind,omitempty" column:"kind,hide"`
+	Name string `json:"name,omitempty" column:"name,hide"`
 }
 
 func (b *BasicK8sMetadata) IsEnriched() bool {
-	return b.Namespace != "" && b.PodName != "" && b.ContainerName != ""
+	return b.Namespace != "" && b.PodName != "" && b.ContainerName != "" && b.PodLabels != nil
 }
 
 type K8sMetadata struct {
@@ -154,6 +178,8 @@ type K8sMetadata struct {
 
 	// HostNetwork is true if the container uses the host network namespace
 	HostNetwork bool `json:"hostNetwork,omitempty" column:"hostnetwork,hide"`
+
+	Owner K8sOwnerReference `json:"owner,omitempty" column:"owner,hide"`
 }
 
 type CommonData struct {
@@ -166,28 +192,76 @@ type CommonData struct {
 	K8s K8sMetadata `json:"k8s,omitempty" column:"k8s" columnTags:"kubernetes"`
 }
 
+func (k *K8sMetadata) UnmarshalJSON(data []byte) error {
+	type Alias K8sMetadata
+	aux := &struct {
+		PodLabels interface{} `json:"podLabels,omitempty"`
+		*Alias
+	}{
+		Alias: (*Alias)(k),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	if aux.PodLabels == nil {
+		return nil
+	}
+
+	switch v := aux.PodLabels.(type) {
+	case string:
+		podLabels, err := parsePodLabels(v)
+		if err != nil {
+			return err
+		}
+		k.PodLabels = podLabels
+	case map[string]interface{}:
+		podLabels := make(map[string]string)
+		for key, value := range v {
+			strVal, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("invalid value type for key %s in PodLabels", key)
+			}
+			podLabels[key] = strVal
+		}
+		if len(podLabels) != 0 {
+			k.PodLabels = podLabels
+		}
+	default:
+		return fmt.Errorf("unexpected type for PodLabels: %T", v)
+	}
+
+	return nil
+}
+
 func (c *CommonData) SetNode(node string) {
 	c.K8s.Node = node
 }
 
-func (c *CommonData) SetPodMetadata(k8s *BasicK8sMetadata, runtime *BasicRuntimeMetadata) {
+func (c *CommonData) SetPodMetadata(container Container) {
+	k8s := container.K8sMetadata()
+	runtime := container.RuntimeMetadata()
+
 	c.K8s.PodName = k8s.PodName
 	c.K8s.Namespace = k8s.Namespace
+	c.K8s.PodLabels = k8s.PodLabels
+	c.K8s.Owner = *container.K8sOwnerReference()
 
 	// All containers in the same pod share the same container runtime
 	c.Runtime.RuntimeName = runtime.RuntimeName
 }
 
-func (c *CommonData) SetContainerMetadata(k8s *BasicK8sMetadata, runtime *BasicRuntimeMetadata) {
+func (c *CommonData) SetContainerMetadata(container Container) {
+	k8s := container.K8sMetadata()
+
 	c.K8s.ContainerName = k8s.ContainerName
 	c.K8s.PodName = k8s.PodName
 	c.K8s.Namespace = k8s.Namespace
+	c.K8s.PodLabels = k8s.PodLabels
+	c.K8s.Owner = *container.K8sOwnerReference()
 
-	c.Runtime.RuntimeName = runtime.RuntimeName
-	c.Runtime.ContainerName = runtime.ContainerName
-	c.Runtime.ContainerID = runtime.ContainerID
-	c.Runtime.ContainerImageName = runtime.ContainerImageName
-	c.Runtime.ContainerImageDigest = runtime.ContainerImageDigest
+	runtime := container.RuntimeMetadata()
+	c.Runtime = *runtime
 }
 
 func (c *CommonData) GetNode() string {
@@ -396,4 +470,21 @@ type WithNetNsID struct {
 
 func (e *WithNetNsID) GetNetNSID() uint64 {
 	return e.NetNsID
+}
+
+// parsePodLabels parses the podLabels string into a map
+func parsePodLabels(s string) (map[string]string, error) {
+	if s == "" {
+		return nil, nil
+	}
+	labels := map[string]string{}
+	pairs := strings.Split(s, ",")
+	for _, pair := range pairs {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid pod labels format: expected key=value, got %s", pair)
+		}
+		labels[kv[0]] = kv[1]
+	}
+	return labels, nil
 }

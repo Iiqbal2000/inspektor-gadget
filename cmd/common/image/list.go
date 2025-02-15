@@ -16,12 +16,17 @@ package image
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/docker/go-units"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
+	"github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/columns"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/columns/formatter/textcolumns"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/oci"
@@ -29,34 +34,72 @@ import (
 
 func NewListCmd() *cobra.Command {
 	var noTrunc bool
+	var outputMode string
+
+	outputModes := []string{utils.OutputModeColumns, utils.OutputModeJSON, utils.OutputModeJSONPretty}
+
 	cmd := &cobra.Command{
 		Use:          "list",
 		Short:        "List gadget images on the host",
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			images, err := oci.ListGadgetImages(context.TODO())
+			images, err := oci.GetGadgetImages(context.TODO())
 			if err != nil {
 				return fmt.Errorf("list gadgets: %w", err)
 			}
 
-			cols := columns.MustCreateColumns[oci.GadgetImageDesc]()
-			if !noTrunc {
-				cols.MustSetExtractor("digest", func(i *oci.GadgetImageDesc) any {
-					if i.Digest == "" {
+			switch outputMode {
+			case utils.OutputModeJSON:
+				bytes, err := json.Marshal(images)
+				if err != nil {
+					return fmt.Errorf("marshalling images to JSON: %w", err)
+				}
+				fmt.Fprint(cmd.OutOrStdout(), string(bytes))
+			case utils.OutputModeJSONPretty:
+				bytes, err := json.MarshalIndent(images, "", "  ")
+				if err != nil {
+					return fmt.Errorf("marshalling images to JSON: %w", err)
+				}
+				fmt.Fprint(cmd.OutOrStdout(), string(bytes))
+			case utils.OutputModeColumns:
+				isTerm := term.IsTerminal(int(os.Stdout.Fd()))
+
+				cols := columns.MustCreateColumns[oci.GadgetImageDesc]()
+				if !noTrunc && isTerm {
+					cols.MustSetExtractor("digest", func(i *oci.GadgetImageDesc) any {
+						if i.Digest == "" {
+							return ""
+						}
+						// Return the shortened digest and remove the sha256: prefix
+						return strings.TrimPrefix(i.Digest, "sha256:")[:12]
+					})
+					now := time.Now()
+					cols.MustSetExtractor("created", func(i *oci.GadgetImageDesc) any {
+						if t, err := time.Parse(time.RFC3339, i.Created); err == nil {
+							return fmt.Sprintf("%s ago", strings.ToLower(units.HumanDuration(now.Sub(t))))
+						}
 						return ""
-					}
-					// Return the shortened digest and remove the sha256: prefix
-					return strings.TrimPrefix(i.Digest, "sha256:")[:12]
-				})
+					})
+				}
+
+				formatter := textcolumns.NewFormatter(cols.GetColumnMap(), textcolumns.WithShouldTruncate(!noTrunc && isTerm))
+				formatter.WriteTable(cmd.OutOrStdout(), images)
+			default:
+				return fmt.Errorf("invalid output mode %q, valid values are: %s", outputMode, strings.Join(outputModes, ", "))
 			}
-			formatter := textcolumns.NewFormatter(cols.GetColumnMap())
-			formatter.WriteTable(os.Stdout, images)
 			return nil
 		},
 	}
 
-	cmd.Flags().BoolVar(&noTrunc, "no-trunc", false, "Don't truncate output")
+	cmd.Flags().BoolVar(&noTrunc, "no-trunc", false, "Don't truncate output, this option is only valid when used in a terminal")
+	cmd.Flags().StringVarP(
+		&outputMode,
+		"output",
+		"o",
+		utils.OutputModeColumns,
+		fmt.Sprintf("Output mode, possible values are, %s", strings.Join(outputModes, ", ")),
+	)
 
 	return cmd
 }

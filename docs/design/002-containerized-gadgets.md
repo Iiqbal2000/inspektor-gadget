@@ -209,7 +209,7 @@ struct event {
 	__u32 pid;
 	__u32 uid;
 	__u32 gid;
-	mnt_ns_id_t mntns_id;
+	gadget_mntns_id mntns_id;
 	int ret;
 	int flags;
 	__u16 mode;
@@ -241,7 +241,7 @@ initially comes from Bumblebee.
 As a consequence, BPF programs written in this way will not be loadable by generic bpf loaders but
 only by Inspektor Gadget.
 
-TODO: Revisit this appproach and check if there is a way to remove the limitation of being loaded by
+TODO: Revisit this approach and check if there is a way to remove the limitation of being loaded by
 other projects.
 
 #### `HashMap` with `stats_` Prefix (a.k.a toppers)
@@ -327,35 +327,35 @@ Symbols:
 - 📅: desired feature, we should plan it
 
 | ebpf program type     | Support | Difficulty |
-|-----------------------|---------|------------|
-| socket_filter         |   👷    |            |
+| --------------------- | ------- | ---------- |
+| socket_filter         | 👷       |            |
 | sk_reuseport/migrate  |         |            |
 | sk_reuseport          |         |            |
-| kprobe/               |   ✅    |            |
+| kprobe/               | ✅       |            |
 | uprobe/               |         |            |
-| kretprobe/            |   ✅    |            |
+| kretprobe/            | ✅       |            |
 | uretprobe/            |         |            |
 | tc                    |         |            |
 | classifier            |         |            |
 | action                |         |            |
-| tracepoint/           |   ✅    |            |
+| tracepoint/           | ✅       |            |
 | tp/                   |         |            |
 | raw_tracepoint/       |         |            |
 | raw_tp/               |         |            |
 | raw_tracepoint.w/     |         |            |
 | raw_tp.w/             |         |            |
 | tp_btf/               |         |            |
-| fentry/               |   📅    |            |
+| fentry/               | 📅       |            |
 | fmod_ret/             |         |            |
-| fexit/                |   📅    |            |
+| fexit/                | 📅       |            |
 | fentry.s/             |         |            |
 | fmod_ret.s/           |         |            |
 | fexit.s/              |         |            |
 | freplace/             |         |            |
 | lsm/                  |         |            |
 | lsm.s/                |         |            |
-| iter/                 |   📅    |            |
-| iter.s/               |   📅    |            |
+| iter/                 | 📅       |            |
+| iter.s/               | 📅       |            |
 | syscall               |         |            |
 | xdp_devmap/           |         |            |
 | xdp_cpumap/           |         |            |
@@ -523,7 +523,7 @@ Some of them are already supported and others are planned.
 Inspektor Gadget provides a set of helper functions in pkg/gadgets/common/mntns_filter.h for gadgets
 that want to filter and enrich events based on the mount namespace inode id information. Inspektor
 Gadget detects the presence of the `gadget_mntns_filter_map` map and populates it with the matching
-containers to filter. Enriching is done by looking for the presence of a field with `mnt_ns_id_t`
+containers to filter. Enriching is done by looking for the presence of a field with `gadget_mntns_id`
 type in the event.
 
 #### Endpoint enrichment
@@ -537,7 +537,7 @@ https://github.com/inspektor-gadget/inspektor-gadget/pull/1825.
 
 Attach ebpf programs of type `BPF_PROG_TYPE_SOCKET_FILTER`. These programs need to be attached in
 each network namespace of interest. Currently it's handled by the
-`pkg/gadgets/internal/networktracer` package. Somehow the same logic needs to be used for
+`pkg/networktracer` package. Somehow the same logic needs to be used for
 containerized gadgets.
 
 #### Socket enricher

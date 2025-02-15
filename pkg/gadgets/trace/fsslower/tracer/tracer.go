@@ -45,49 +45,68 @@ type Tracer struct {
 	enricher      gadgets.DataEnricherByMntNs
 	eventCallback func(*types.Event)
 
-	objs           fsslowerObjects
-	readEnterLink  link.Link
-	readExitLink   link.Link
-	writeEnterLink link.Link
-	writeExitLink  link.Link
-	openEnterLink  link.Link
-	openExitLink   link.Link
-	syncEnterLink  link.Link
-	syncExitLink   link.Link
-	reader         *perf.Reader
+	objs            fsslowerObjects
+	readEnterLink   link.Link
+	readExitLink    link.Link
+	writeEnterLink  link.Link
+	writeExitLink   link.Link
+	openEnterLink   link.Link
+	openExitLink    link.Link
+	syncEnterLink   link.Link
+	syncExitLink    link.Link
+	statfsEnterLink link.Link
+	statfsExitLink  link.Link
+	reader          *perf.Reader
 }
 
 type fsConf struct {
-	read  string
-	write string
-	open  string
-	fsync string
+	read   string
+	write  string
+	open   string
+	fsync  string
+	statfs string
 }
 
 var fsConfMap = map[string]fsConf{
 	"btrfs": {
-		read:  "btrfs_file_read_iter",
-		write: "btrfs_file_write_iter",
-		open:  "btrfs_file_open",
-		fsync: "btrfs_sync_file",
+		read:   "btrfs_file_read_iter",
+		write:  "btrfs_file_write_iter",
+		open:   "btrfs_file_open",
+		fsync:  "btrfs_sync_file",
+		statfs: "btrfs_statfs",
 	},
 	"ext4": {
-		read:  "ext4_file_read_iter",
-		write: "ext4_file_write_iter",
-		open:  "ext4_file_open",
-		fsync: "ext4_sync_file",
+		read:   "ext4_file_read_iter",
+		write:  "ext4_file_write_iter",
+		open:   "ext4_file_open",
+		fsync:  "ext4_sync_file",
+		statfs: "ext4_statfs",
+	},
+	"fuse": {
+		read:  "fuse_file_read_iter",
+		write: "fuse_file_write_iter",
+		open:  "fuse_open",
+		fsync: "fuse_fsync",
 	},
 	"nfs": {
-		read:  "nfs_file_read",
-		write: "nfs_file_write",
-		open:  "nfs_file_open",
-		fsync: "nfs_file_fsync",
+		read:   "nfs_file_read",
+		write:  "nfs_file_write",
+		open:   "nfs_file_open",
+		fsync:  "nfs_file_fsync",
+		statfs: "nfs_statfs",
+	},
+	"ntfs3": {
+		read:  "ntfs_file_read_iter",
+		write: "ntfs_file_write_iter",
+		open:  "ntfs_file_open",
+		fsync: "generic_file_fsync",
 	},
 	"xfs": {
-		read:  "xfs_file_read_iter",
-		write: "xfs_file_write_iter",
-		open:  "xfs_file_open",
-		fsync: "xfs_file_fsync",
+		read:   "xfs_file_read_iter",
+		write:  "xfs_file_write_iter",
+		open:   "xfs_file_open",
+		fsync:  "xfs_file_fsync",
+		statfs: "xfs_fs_statfs",
 	},
 }
 
@@ -132,6 +151,10 @@ func (t *Tracer) close() {
 	// sync
 	t.syncEnterLink = gadgets.CloseLink(t.syncEnterLink)
 	t.syncExitLink = gadgets.CloseLink(t.syncExitLink)
+
+	// statfs
+	t.statfsEnterLink = gadgets.CloseLink(t.statfsEnterLink)
+	t.statfsExitLink = gadgets.CloseLink(t.statfsExitLink)
 
 	if t.reader != nil {
 		t.reader.Close()
@@ -202,14 +225,29 @@ func (t *Tracer) install() error {
 		return fmt.Errorf("attaching kretprobe: %w", err)
 	}
 
+	// statfs
+	t.statfsEnterLink, err = link.Kprobe(fsConf.statfs, t.objs.IgFsslStatfsE, nil)
+	if err != nil {
+		return fmt.Errorf("attaching kprobe: %w", err)
+	}
+	t.statfsExitLink, err = link.Kretprobe(fsConf.statfs, t.objs.IgFsslStatfsX, nil)
+	if err != nil {
+		return fmt.Errorf("attaching kretprobe: %w", err)
+	}
+
 	t.reader, err = perf.NewReader(t.objs.fsslowerMaps.Events, gadgets.PerfBufferPages*os.Getpagesize())
 	if err != nil {
 		return fmt.Errorf("creating perf ring buffer: %w", err)
 	}
+
+	if err := gadgets.FreezeMaps(t.objs.fsslowerMaps.Events); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-var ops = []string{"R", "W", "O", "F"}
+var ops = []string{"R", "W", "O", "F", "S"}
 
 func (t *Tracer) run() {
 	for {
@@ -220,9 +258,9 @@ func (t *Tracer) run() {
 				return
 			}
 
-			msg := fmt.Sprintf("Error reading perf ring buffer: %s", err)
-			t.eventCallback(types.Base(eventtypes.Err(msg)))
-			return
+			msg := fmt.Sprintf("reading perf ring buffer: %s", err)
+			t.eventCallback(types.Base(eventtypes.Warn(msg)))
+			continue
 		}
 
 		if record.LostSamples > 0 {

@@ -1,4 +1,4 @@
-// Copyright 2023 The Inspektor Gadget authors
+// Copyright 2023-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,7 +24,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/common"
+	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	_ "github.com/inspektor-gadget/inspektor-gadget/pkg/all-gadgets"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/config"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/environment"
 	grpcruntime "github.com/inspektor-gadget/inspektor-gadget/pkg/runtime/grpc"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/experimental"
@@ -40,6 +43,7 @@ func main() {
 		Use:   filepath.Base(os.Args[0]),
 		Short: "Collection of gadgets for containers",
 	}
+	common.AddConfigFlag(rootCmd)
 	common.AddVerboseFlag(rootCmd)
 
 	skipInfo := false
@@ -55,6 +59,9 @@ func main() {
 
 	runtime := grpcruntime.New()
 
+	// save the root flags for later use before we modify them (e.g. add runtime flags)
+	rootFlags := commonutils.CopyFlagSet(rootCmd.PersistentFlags())
+
 	runtimeGlobalParams := runtime.GlobalParamDescs().ToParams()
 	common.AddFlags(rootCmd, runtimeGlobalParams, nil, runtime)
 	err := runtime.Init(runtimeGlobalParams)
@@ -66,14 +73,37 @@ func main() {
 		// evaluate flags early for runtimeGlobalFlags; this will make
 		// sure that --remote-address has already been parsed when calling
 		// InitDeployInfo(), so it can target the specified address
-		rootCmd.ParseFlags(os.Args[1:])
-		runtime.InitDeployInfo()
+
+		err := commonutils.ParseEarlyFlags(rootCmd, os.Args[1:])
+		if err != nil {
+			// Analogous to cobra error message
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		info, err := runtime.InitDeployInfo()
+		if err != nil {
+			log.Warnf("Failed to load deploy info: %s", err)
+		} else if err := commonutils.CheckServerVersionSkew(info.ServerVersion); err != nil {
+			log.Warnf(err.Error())
+		}
+	}
+
+	// ensure that the runtime flags are set from the config file
+	if err := common.InitConfig(rootFlags); err != nil {
+		log.Fatalf("initializing config: %v", err)
+	}
+	if err = common.SetFlagsForParams(rootCmd, runtimeGlobalParams, config.RuntimeKey); err != nil {
+		log.Fatalf("setting runtime flags from config: %v", err)
 	}
 
 	hiddenColumnTags := []string{"kubernetes"}
 	common.AddCommandsFromRegistry(rootCmd, runtime, hiddenColumnTags)
 
+	common.AddInstanceCommands(rootCmd, runtime)
 	rootCmd.AddCommand(common.NewSyncCommand(runtime))
+	rootCmd.AddCommand(common.NewRunCommand(rootCmd, runtime, hiddenColumnTags, common.CommandModeRun))
+	rootCmd.AddCommand(common.NewRunCommand(rootCmd, runtime, hiddenColumnTags, common.CommandModeAttach))
+	rootCmd.AddCommand(common.NewConfigCmd(runtime, rootFlags))
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

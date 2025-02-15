@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,6 +26,7 @@ import (
 	"syscall"
 
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/vishvananda/netlink"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/containerd"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/crio"
@@ -34,6 +36,7 @@ import (
 	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
+	nsenter "github.com/inspektor-gadget/inspektor-gadget/pkg/utils/nsenter"
 )
 
 var AvailableRuntimes = []string{
@@ -43,6 +46,11 @@ var AvailableRuntimes = []string{
 	types.RuntimeNamePodman.String(),
 }
 
+var AvailableRuntimeProtocols = []string{
+	containerutilsTypes.RuntimeProtocolInternal,
+	containerutilsTypes.RuntimeProtocolCRI,
+}
+
 func NewContainerRuntimeClient(runtime *containerutilsTypes.RuntimeConfig) (runtimeclient.ContainerRuntimeClient, error) {
 	switch runtime.Name {
 	case types.RuntimeNameDocker:
@@ -50,13 +58,13 @@ func NewContainerRuntimeClient(runtime *containerutilsTypes.RuntimeConfig) (runt
 		if envsp := os.Getenv("INSPEKTOR_GADGET_DOCKER_SOCKETPATH"); envsp != "" && socketPath == "" {
 			socketPath = filepath.Join(host.HostRoot, envsp)
 		}
-		return docker.NewDockerClient(socketPath)
+		return docker.NewDockerClient(socketPath, runtime.RuntimeProtocol)
 	case types.RuntimeNameContainerd:
 		socketPath := runtime.SocketPath
 		if envsp := os.Getenv("INSPEKTOR_GADGET_CONTAINERD_SOCKETPATH"); envsp != "" && socketPath == "" {
 			socketPath = filepath.Join(host.HostRoot, envsp)
 		}
-		return containerd.NewContainerdClient(socketPath, runtime.Extra)
+		return containerd.NewContainerdClient(socketPath, runtime.RuntimeProtocol, &runtime.Extra)
 	case types.RuntimeNameCrio:
 		socketPath := runtime.SocketPath
 		if envsp := os.Getenv("INSPEKTOR_GADGET_CRIO_SOCKETPATH"); envsp != "" && socketPath == "" {
@@ -116,4 +124,60 @@ func ParseOCIState(stateBuf []byte) (id string, pid int, err error) {
 	id = ociState.ID
 	pid = ociState.Pid
 	return
+}
+
+// GetIfacePeers returns the networking interfaces on the host side of the container where pid is
+// running in.
+func GetIfacePeers(pid int) ([]*net.Interface, error) {
+	var ifaceLinks []int
+
+	err := nsenter.NetnsEnter(pid, func() error {
+		links, err := netlink.LinkList()
+		if err != nil {
+			return fmt.Errorf("getting links: %w", err)
+		}
+
+		for _, link := range links {
+			veth, ok := link.(*netlink.Veth)
+			if !ok {
+				continue
+			}
+
+			if veth.LinkAttrs.Flags&net.FlagUp == 0 {
+				continue
+			}
+
+			ifaceLink, err := netlink.VethPeerIndex(veth)
+			if err != nil {
+				return fmt.Errorf("getting veth's pair index: %w", err)
+			}
+
+			ifaceLinks = append(ifaceLinks, ifaceLink)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ifaceLinks) == 0 {
+		return nil, fmt.Errorf("no interface found")
+	}
+
+	ifacesHost := make([]*net.Interface, 0, len(ifaceLinks))
+
+	err = nsenter.NetnsEnter(1, func() error {
+		for _, ifaceLink := range ifaceLinks {
+			ifaceHost, err := net.InterfaceByIndex(ifaceLink)
+			if err != nil {
+				return fmt.Errorf("getting interface by index: %w", err)
+			}
+
+			ifacesHost = append(ifacesHost, ifaceHost)
+		}
+		return nil
+	})
+
+	return ifacesHost, err
 }

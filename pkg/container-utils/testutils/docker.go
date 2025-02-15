@@ -19,10 +19,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 )
 
@@ -46,18 +48,6 @@ type DockerContainer struct {
 	client *client.Client
 }
 
-func (d *DockerContainer) Running() bool {
-	return d.started
-}
-
-func (d *DockerContainer) ID() string {
-	return d.id
-}
-
-func (d *DockerContainer) Pid() int {
-	return d.pid
-}
-
 func (d *DockerContainer) initClient() error {
 	var err error
 	d.client, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -72,9 +62,9 @@ func (d *DockerContainer) Run(t *testing.T) {
 		t.Fatalf("Failed to initialize client: %s", err)
 	}
 
-	_ = d.client.ContainerRemove(d.options.ctx, d.name, types.ContainerRemoveOptions{})
+	_ = d.client.ContainerRemove(d.options.ctx, d.name, container.RemoveOptions{})
 
-	reader, err := d.client.ImagePull(d.options.ctx, d.options.image, types.ImagePullOptions{})
+	reader, err := d.client.ImagePull(d.options.ctx, d.options.image, image.PullOptions{})
 	if err != nil {
 		t.Fatalf("Failed to pull image container: %s", err)
 	}
@@ -83,6 +73,28 @@ func (d *DockerContainer) Run(t *testing.T) {
 	hostConfig := &container.HostConfig{}
 	if d.options.seccompProfile != "" {
 		hostConfig.SecurityOpt = []string{fmt.Sprintf("seccomp=%s", d.options.seccompProfile)}
+	}
+	if d.options.privileged {
+		hostConfig.Privileged = true
+	}
+
+	if d.options.portBindings != nil {
+		hostConfig.PortBindings = d.options.portBindings
+	}
+
+	for _, m := range d.options.mounts {
+		paths := strings.SplitN(m, ":", 2)
+		source := m
+		target := m
+		if len(paths) == 2 {
+			source = paths[0]
+			target = paths[1]
+		}
+		hostConfig.Mounts = append(hostConfig.Mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: source,
+			Target: target,
+		})
 	}
 
 	resp, err := d.client.ContainerCreate(d.options.ctx, &container.Config{
@@ -93,9 +105,24 @@ func (d *DockerContainer) Run(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create container: %s", err)
 	}
-	if err := d.client.ContainerStart(d.options.ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+	err = d.client.ContainerStart(d.options.ctx, resp.ID, container.StartOptions{})
+	if d.options.expectStartError {
+		if err == nil {
+			t.Fatalf("Expected error creating container")
+		}
+		t.Logf("Failed to create container as expected: %s", err)
+		if d.options.removal {
+			err := d.removeAndClose()
+			if err != nil {
+				t.Logf("Failed to remove container: %s", err)
+			}
+		}
+		return
+	}
+	if err != nil {
 		t.Fatalf("Failed to start container: %s", err)
 	}
+
 	d.id = resp.ID
 
 	if d.options.wait {
@@ -114,8 +141,18 @@ func (d *DockerContainer) Run(t *testing.T) {
 	}
 	d.pid = containerJSON.State.Pid
 
+	if len(containerJSON.NetworkSettings.Networks) > 1 {
+		t.Fatal("Multiple networks are not supported")
+	}
+
+	if len(containerJSON.NetworkSettings.Networks) == 1 {
+		d.ip = containerJSON.NetworkSettings.IPAddress
+	}
+
+	d.portBindings = containerJSON.NetworkSettings.Ports
+
 	if d.options.logs {
-		out, err := d.client.ContainerLogs(d.options.ctx, resp.ID, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
+		out, err := d.client.ContainerLogs(d.options.ctx, resp.ID, container.LogsOptions{ShowStdout: true, ShowStderr: true})
 		if err != nil {
 			t.Fatalf("Failed to get container logs: %s", err)
 		}
@@ -171,7 +208,7 @@ func (d *DockerContainer) Stop(t *testing.T) {
 }
 
 func (d *DockerContainer) removeAndClose() error {
-	err := d.client.ContainerRemove(d.options.ctx, d.name, types.ContainerRemoveOptions{Force: true})
+	err := d.client.ContainerRemove(d.options.ctx, d.name, container.RemoveOptions{Force: true})
 	if err != nil {
 		return fmt.Errorf("removing container: %w", err)
 	}

@@ -1,0 +1,41 @@
+name: trace tcpdrop
+description: trace TCP packets dropped by the kernel
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://www.inspektor-gadget.io/docs/latest/gadgets/trace_tcpdrop
+sourceURL: https://github.com/inspektor-gadget/inspektor-gadget/tree/main/gadgets/trace_tcpdrop
+datasources:
+  tcpdrop:
+    fields:
+      src:
+        annotations:
+          template: l4endpoint
+      dst:
+        annotations:
+          template: l4endpoint
+      tcpflags_raw:
+        annotations:
+          columns.hidden: true
+      tcpflags:
+        annotations:
+          description: TCP flags from a TCP header
+      reason_raw:
+        annotations:
+          columns.hidden: true
+      reason:
+        annotations:
+          description: Reason for dropping a packet
+          columns.ellipsis: start
+      state_raw:
+        annotations:
+          columns.hidden: true
+      state:
+        annotations:
+          description: State of the TCP connection
+      kernel_stack_raw:
+        annotations:
+          columns.hidden: true
+      kernel_stack:
+        annotations:
+          description: Kernel stack
+          columns.hidden: true
+          columns.width: 20

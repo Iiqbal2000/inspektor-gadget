@@ -25,7 +25,7 @@ import (
 )
 
 func (tf *TextColumnsFormatter[T]) setFormatter(column *Column[T]) {
-	ff := columns.GetFieldAsStringExt[T](column.col, 'f', column.col.Precision)
+	ff := columns.GetFieldAsStringExt[T](column.col, 'f', column.col.Precision, column.col.Hex)
 	column.formatter = func(entry *T) string {
 		return tf.buildFixedString(ff(entry), column.calculatedWidth, column.col.EllipsisType, column.col.Alignment)
 	}
@@ -35,6 +35,11 @@ func (tf *TextColumnsFormatter[T]) buildFixedString(s string, length int, ellips
 	if length <= 0 {
 		return ""
 	}
+
+	if !tf.options.ShouldTruncate {
+		return s
+	}
+
 	rs := []rune(s)
 
 	shortened := ellipsis.Shorten(rs, length, ellipsisType)
@@ -72,6 +77,9 @@ func (tf *TextColumnsFormatter[T]) FormatHeader() string {
 			row.WriteString(tf.options.ColumnDivider)
 		}
 		name := column.col.Name
+		if column.col.Alias != "" {
+			name = column.col.Alias
+		}
 		switch tf.options.HeaderStyle {
 		case HeaderStyleUppercase:
 			name = strings.ToUpper(name)
@@ -110,7 +118,7 @@ func (tf *TextColumnsFormatter[T]) FormatTable(entries []*T) string {
 	return string(out[:len(out)-1])
 }
 
-// WriteTable writes header, divider nd the formatted entries with the current settings to writer
+// WriteTable writes header, divider and the formatted entries with the current settings to writer
 func (tf *TextColumnsFormatter[T]) WriteTable(writer io.Writer, entries []*T) error {
 	_, err := writer.Write([]byte(tf.FormatHeader()))
 	if err != nil {

@@ -23,13 +23,15 @@ import (
 	"github.com/spf13/cobra"
 	seccompprofile "sigs.k8s.io/security-profiles-operator/api/seccompprofile/v1beta1"
 
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
 	commonadvise "github.com/inspektor-gadget/inspektor-gadget/cmd/common/advise"
 	commonutils "github.com/inspektor-gadget/inspektor-gadget/cmd/common/utils"
 	"github.com/inspektor-gadget/inspektor-gadget/cmd/kubectl-gadget/utils"
 	gadgetv1alpha1 "github.com/inspektor-gadget/inspektor-gadget/pkg/apis/gadget/v1alpha1"
-	"k8s.io/apimachinery/pkg/runtime"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var seccompAdvisorStartCmd = &cobra.Command{
@@ -58,9 +60,9 @@ var (
 	profilePrefix string
 )
 
-func newSeccompProfileCmd() *cobra.Command {
+func newSeccompProfileCmd(gadgetNamespace string) *cobra.Command {
 	seccompProfileCmd := commonadvise.NewSeccompProfileCmd(nil)
-	utils.AddCommonFlags(seccompProfileCmd, &params)
+	utils.AddCommonFlags(seccompProfileCmd, &params, gadgetNamespace)
 
 	seccompProfileCmd.AddCommand(seccompAdvisorStartCmd)
 	seccompAdvisorStartCmd.PersistentFlags().StringVarP(&outputMode,
@@ -106,6 +108,7 @@ func runSeccompAdvisorStart(cmd *cobra.Command, args []string) error {
 
 	config := &utils.TraceConfig{
 		GadgetName:        "seccomp",
+		GadgetNamespace:   gadgetNamespace,
 		Operation:         gadgetv1alpha1.OperationStart,
 		TraceOutputMode:   traceOutputMode,
 		TraceOutput:       profilePrefix,
@@ -136,15 +139,21 @@ func getSeccompProfilesName(traceID string) ([]string, error) {
 
 	// Get a manager on seccompprofile.
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:             scheme,
-		MetricsBindAddress: "0", // TCP port can be set to "0" to disable the metrics serving
-		ClientDisableCacheFor: []client.Object{
-			// We need to disable cache otherwise we get the following error message:
-			// the cache is not started, can not read objects
-			// Since this manager will be created each time user interacts with the
-			// CLI the cache will not persist, so there is not really advantages of
-			// using a cache.
-			&seccompprofile.SeccompProfile{},
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: "0", // TCP port can be set to "0" to disable the metrics serving
+		},
+		// We need to disable cache otherwise we get the following error message:
+		// the cache is not started, can not read objects
+		// Since this manager will be created each time user interacts with the
+		// CLI the cache will not persist, so there is not really advantages of
+		// using a cache.
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{
+					&seccompprofile.SeccompProfile{},
+				},
+			},
 		},
 	})
 	if err != nil {
@@ -206,21 +215,21 @@ func runSeccompAdvisorStop(cmd *cobra.Command, args []string) error {
 	// Maybe there is no trace with the given ID.
 	// But it is better to try to delete something which does not exist than
 	// leaking a resource.
-	defer utils.DeleteTrace(traceID)
+	defer utils.DeleteTrace(gadgetNamespace, traceID)
 
-	err := utils.SetTraceOperation(traceID, string(gadgetv1alpha1.OperationGenerate))
+	err := utils.SetTraceOperation(gadgetNamespace, traceID, string(gadgetv1alpha1.OperationGenerate))
 	if err != nil {
 		return commonutils.WrapInErrGenGadgetOutput(err)
 	}
 
 	// We stop the trace so its Status.State become Stopped.
 	// Indeed, generate operation does not change value of Status.State.
-	err = utils.SetTraceOperation(traceID, string(gadgetv1alpha1.OperationStop))
+	err = utils.SetTraceOperation(gadgetNamespace, traceID, string(gadgetv1alpha1.OperationStop))
 	if err != nil {
 		return commonutils.WrapInErrStopGadget(err)
 	}
 
-	err = utils.PrintTraceOutputFromStatus(traceID, string(gadgetv1alpha1.TraceStateStopped), callback)
+	err = utils.PrintTraceOutputFromStatus(gadgetNamespace, traceID, string(gadgetv1alpha1.TraceStateStopped), callback)
 	if err != nil {
 		return commonutils.WrapInErrGetGadgetOutput(err)
 	}
@@ -232,8 +241,9 @@ func runSeccompAdvisorStop(cmd *cobra.Command, args []string) error {
 // parameter.
 func runSeccompAdvisorList(cmd *cobra.Command, args []string) error {
 	config := &utils.TraceConfig{
-		GadgetName:  "seccomp",
-		CommonFlags: &params,
+		GadgetName:      "seccomp",
+		GadgetNamespace: gadgetNamespace,
+		CommonFlags:     &params,
 	}
 
 	err := utils.PrintAllTraces(config)

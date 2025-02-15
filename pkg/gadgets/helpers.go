@@ -1,4 +1,4 @@
-// Copyright 2019-2021 The Inspektor Gadget authors
+// Copyright 2019-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,18 +21,18 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
-	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/btfgen"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
+	ebpfutils "github.com/inspektor-gadget/inspektor-gadget/pkg/utils/ebpf"
 )
 
 // CloseLink closes l if it's not nil and returns nil
@@ -61,29 +61,6 @@ type DataNodeEnricher interface {
 // is available.
 type DataEnricherByNetNs interface {
 	EnrichByNetNs(event *types.CommonData, netnsid uint64)
-}
-
-func FromCString(in []byte) string {
-	for i := 0; i < len(in); i++ {
-		if in[i] == 0 {
-			return string(in[:i])
-		}
-	}
-	return string(in)
-}
-
-func FromCStringN(in []byte, length int) string {
-	l := len(in)
-	if length < l {
-		l = length
-	}
-
-	for i := 0; i < l; i++ {
-		if in[i] == 0 {
-			return string(in[:i])
-		}
-	}
-	return string(in[:l])
 }
 
 func Htonl(hl uint32) uint32 {
@@ -187,38 +164,12 @@ func WallTimeFromBootTime(ts uint64) types.Time {
 	return types.Time(time.Unix(0, int64(ts)).Add(timeDiff).UnixNano())
 }
 
-var (
-	bpfKtimeGetBootNsOnce   sync.Once
-	bpfKtimeGetBootNsExists bool
-)
-
-// DetectBpfKtimeGetBootNs returns true if bpf_ktime_get_boot_ns is available
-// in the current kernel. False negatives are possible if BTF is not available.
-func DetectBpfKtimeGetBootNs() bool {
-	bpfKtimeGetBootNsOnce.Do(func() {
-		bpfKtimeGetBootNsExists = false
-
-		btfSpec, err := btf.LoadKernelSpec()
-		if err != nil {
-			return
-		}
-
-		enum := &btf.Enum{}
-		err = btfSpec.TypeByName("bpf_func_id", &enum)
-		if err != nil {
-			return
-		}
-
-		for _, value := range enum.Values {
-			if value.Name == "BPF_FUNC_ktime_get_boot_ns" && value.Value == BpfKtimeGetBootNsFuncID {
-				bpfKtimeGetBootNsExists = true
-
-				return
-			}
-		}
-	})
-
-	return bpfKtimeGetBootNsExists
+// HasBpfKtimeGetBootNs returns true if bpf_ktime_get_boot_ns is available
+func HasBpfKtimeGetBootNs() bool {
+	// We only care about the helper, hence test with ebpf.SocketFilter that exist in all
+	// kernels that support ebpf.
+	err := features.HaveProgramHelper(ebpf.SocketFilter, asm.FnKtimeGetBootNs)
+	return err == nil
 }
 
 // removeBpfKtimeGetBootNs removes calls to bpf_ktime_get_boot_ns and replaces
@@ -231,7 +182,7 @@ func removeBpfKtimeGetBootNs(p *ebpf.ProgramSpec) {
 
 		if in.OpCode.Class().IsJump() &&
 			in.OpCode.JumpOp() == asm.Call &&
-			in.Constant == BpfKtimeGetBootNsFuncID {
+			in.Constant == int64(asm.FnKtimeGetBootNs) {
 			// reset timestamp to zero
 			in.OpCode = asm.Mov.Op(asm.ImmSource)
 			in.Dst = asm.R0
@@ -243,7 +194,7 @@ func removeBpfKtimeGetBootNs(p *ebpf.ProgramSpec) {
 // FixBpfKtimeGetBootNs checks if bpf_ktime_get_boot_ns is supported by the
 // kernel and removes it if not
 func FixBpfKtimeGetBootNs(programSpecs map[string]*ebpf.ProgramSpec) {
-	if DetectBpfKtimeGetBootNs() {
+	if HasBpfKtimeGetBootNs() {
 		return
 	}
 
@@ -277,8 +228,8 @@ func LoadeBPFSpec(
 
 	consts[FilterByMntNsName] = filterByMntNs
 
-	if err := spec.RewriteConstants(consts); err != nil {
-		return fmt.Errorf("rewriting constants: %w", err)
+	if err := ebpfutils.SpecSetVars(spec, consts); err != nil {
+		return err
 	}
 
 	opts := ebpf.CollectionOptions{
@@ -290,6 +241,19 @@ func LoadeBPFSpec(
 
 	if err := spec.LoadAndAssign(objs, &opts); err != nil {
 		return fmt.Errorf("loading maps and programs: %w", err)
+	}
+
+	return nil
+}
+
+func FreezeMaps(maps ...*ebpf.Map) error {
+	for _, m := range maps {
+		if err := m.Freeze(); err != nil {
+			if info, _ := m.Info(); info != nil {
+				return fmt.Errorf("freezing map %s: %w", info.Name, err)
+			}
+			return fmt.Errorf("freezing map: %w", err)
+		}
 	}
 
 	return nil

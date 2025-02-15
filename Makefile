@@ -6,11 +6,18 @@ IMAGE_TAG ?= $(shell ./tools/image-tag branch)
 
 MINIKUBE ?= minikube
 KUBERNETES_DISTRIBUTION ?= ""
-GADGET_TAG ?= $(shell ../tools/image-tag branch)
+GADGET_TAG ?= $(shell ./tools/image-tag branch)
 GADGET_REPOSITORY ?= ghcr.io/inspektor-gadget/gadget
+VERIFY_GADGETS ?= true
+TEST_COMPONENT ?= inspektor-gadget
 
 GOHOSTOS ?= $(shell go env GOHOSTOS)
 GOHOSTARCH ?= $(shell go env GOHOSTARCH)
+GOPROXY ?= $(shell go env GOPROXY)
+
+DLV ?= dlv
+
+BUILD_COMMAND ?= docker buildx build
 
 KUBERNETES_ARCHITECTURE ?= $(GOHOSTARCH)
 
@@ -20,9 +27,9 @@ BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/' | sed 's/ppc64le/powerpc/' | sed 's/mips.*/mips/')
 
 # This version number must be kept in sync with CI workflow lint one.
-LINTER_VERSION ?= v1.49.0
+LINTER_IMAGE ?= golangci/golangci-lint:v1.63.4@sha256:7f4c8ee8a63d56caa41c099cf658f68b192b615e0f30e94b8864e81a3ceafb53
 
-EBPF_BUILDER ?= ghcr.io/inspektor-gadget/ebpf-builder
+EBPF_BUILDER ?= ghcr.io/inspektor-gadget/ebpf-builder:latest
 
 DNSTESTER_IMAGE ?= "ghcr.io/inspektor-gadget/dnstester:latest"
 
@@ -52,7 +59,7 @@ include crd.mk
 include tests.mk
 include minikube.mk
 
-LDFLAGS := "-X github.com/inspektor-gadget/inspektor-gadget/cmd/common.version=$(VERSION) \
+LDFLAGS := "-X github.com/inspektor-gadget/inspektor-gadget/internal/version.version=$(VERSION) \
 -X main.gadgetimage=$(CONTAINER_REPO):$(IMAGE_TAG) \
 -extldflags '-static'"
 
@@ -86,8 +93,8 @@ ebpf-objects-outside-docker:
 #
 # Since Ubuntu does not install it in a standard path, add a compiler flag for
 # it.
-	TARGET=arm64 CFLAGS="-I/usr/include/$(uname -m)-linux-gnu -I$(shell pwd)/include/gadget/arm64/ -I$(shell pwd)/include/" go generate ./...
-	TARGET=amd64 CFLAGS="-I/usr/include/$(uname -m)-linux-gnu -I$(shell pwd)/include/gadget/amd64/ -I$(shell pwd)/include/" go generate ./...
+	TARGET=arm64 CFLAGS="-I/usr/include/$(shell uname -m)-linux-gnu -I$(shell pwd)/include/gadget/arm64/ -I$(shell pwd)/include/" go generate ./...
+	TARGET=amd64 CFLAGS="-I/usr/include/$(shell uname -m)-linux-gnu -I$(shell pwd)/include/gadget/amd64/ -I$(shell pwd)/include/" go generate ./...
 
 # ig
 
@@ -105,6 +112,20 @@ ig-all: $(IG_TARGETS) ig
 ig: ig-$(GOHOSTOS)-$(GOHOSTARCH)
 	cp ig-$(GOHOSTOS)-$(GOHOSTARCH) ig
 
+# Compile ig with debug options and debug it using delve:
+# -N: disable optimization.
+# -l: disable inlining.
+# See: https://pkg.go.dev/cmd/compile
+debug-ig:
+	CGO_ENABLED=0 go build \
+		-ldflags "-X github.com/inspektor-gadget/inspektor-gadget/internal/version.version=${VERSION} \
+		-X github.com/inspektor-gadget/inspektor-gadget/cmd/common/image.builderImage=${EBPF_BUILDER} \
+		-extldflags '-static'" \
+		-gcflags='all=-N -l' \
+		-o ig-debug \
+		./cmd/ig
+	sudo IG_EXPERIMENTAL=true $(DLV) exec ig-debug
+
 .PHONY: install/ig
 install/ig: ig
 	sudo cp ig /usr/local/bin/ig
@@ -116,8 +137,9 @@ ig-%: phony_explicit
 		$(MAKE) -f Makefile.btfgen \
 			ARCH=$(subst linux-,,$*) BTFHUB_ARCHIVE=$(HOME)/btfhub-archive/ -j$(nproc); \
 	fi
-	docker buildx build --load --platform=$(subst -,/,$*) -t $@ -f Dockerfiles/ig.Dockerfile \
-		--build-arg VERSION=$(VERSION) .
+	$(BUILD_COMMAND) --load --platform=$(subst -,/,$*) -t $@ -f Dockerfiles/ig.Dockerfile \
+		--build-arg VERSION=$(VERSION) --build-arg EBPF_BUILDER=$(EBPF_BUILDER) \
+		--build-arg GOPROXY=$(GOPROXY) .
 	docker create --name ig-$*-container $@
 	docker cp ig-$*-container:/usr/bin/ig $@
 	docker rm ig-$*-container
@@ -190,7 +212,8 @@ gadget-container:
 		$(MAKE) -f Makefile.btfgen \
 			BTFHUB_ARCHIVE=$(HOME)/btfhub-archive/ -j$(nproc); \
 	fi
-	docker buildx build --load -t $(CONTAINER_REPO):$(IMAGE_TAG) \
+	$(BUILD_COMMAND) --load -t $(CONTAINER_REPO):$(IMAGE_TAG) \
+		--build-arg GOPROXY=$(GOPROXY) --build-arg VERSION=$(VERSION) \
 		-f Dockerfiles/gadget.Dockerfile .
 
 .PHONY: cross-gadget-container
@@ -202,8 +225,8 @@ cross-gadget-container:
 		$(MAKE) -f Makefile.btfgen \
 			ARCH=arm64 BTFHUB_ARCHIVE=$(HOME)/btfhub-archive/ -j$(nproc); \
 	fi
-	docker buildx build --platform=$(PLATFORMS) -t $(CONTAINER_REPO):$(IMAGE_TAG) \
-		--push \
+	$(BUILD_COMMAND) --platform=$(PLATFORMS) -t $(CONTAINER_REPO):$(IMAGE_TAG) \
+		--push --build-arg GOPROXY=$(GOPROXY) --build-arg VERSION=$(VERSION) \
 		-f Dockerfiles/gadget.Dockerfile .
 
 push-gadget-container:
@@ -212,18 +235,24 @@ push-gadget-container:
 # kubectl-gadget container image
 .PHONY: kubectl-gadget-container
 kubectl-gadget-container:
-	docker buildx build --load -t kubectl-gadget -f Dockerfiles/kubectl-gadget.Dockerfile \
-	--build-arg IMAGE_TAG=$(IMAGE_TAG) .
+	$(BUILD_COMMAND) --load -t kubectl-gadget -f Dockerfiles/kubectl-gadget.Dockerfile \
+	--build-arg IMAGE_TAG=$(IMAGE_TAG) --build-arg GOPROXY=$(GOPROXY) .
 
 .PHONY: cross-kubectl-gadget-container
 cross-kubectl-gadget-container:
-	docker buildx build --platform=$(PLATFORMS) -t kubectl-gadget -f Dockerfiles/kubectl-gadget.Dockerfile \
-	--build-arg IMAGE_TAG=$(IMAGE_TAG) .
+	$(BUILD_COMMAND) --platform=$(PLATFORMS) -t kubectl-gadget -f Dockerfiles/kubectl-gadget.Dockerfile \
+	--build-arg IMAGE_TAG=$(IMAGE_TAG) --build-arg GOPROXY=$(GOPROXY) .
 
 # tests
+.PHONY: generate-testdata
+generate-testdata: 
+	$(MAKE) -C ./pkg/operators/ebpf/testdata
+	$(MAKE) -C ./pkg/operators/wasm/testdata
+
 .PHONY: test
-test:
-	go test -test.v ./...
+test: generate-testdata
+	# skip gadgets tests
+	go test -exec sudo -v $$(go list ./... | grep -v 'github.com/inspektor-gadget/inspektor-gadget/gadgets')
 
 .PHONY: controller-tests
 controller-tests: kube-apiserver etcd kubectl
@@ -232,10 +261,6 @@ controller-tests: kube-apiserver etcd kubectl
 	TEST_ASSET_ETCD=$(ETCD_BIN) \
 	TEST_ASSET_KUBECTL=$(KUBECTL_BIN) \
 	go test -test.v ./pkg/controllers/... -controller-test
-
-.PHONY: gadgets-unit-tests
-gadgets-unit-tests:
-	go test -test.v -exec sudo ./...
 
 # Individual tests can be selected with a command such as:
 # go test -exec sudo -ldflags="-s=false" -bench='^BenchmarkAllGadgetsWithContainers$/^container100$/snapshot-socket' -run=Benchmark ./internal/benchmarks/... -count 10
@@ -252,28 +277,42 @@ ig-tests:
 	rm -f ./ig-manager.test
 
 # INTEGRATION_TESTS_PARAMS can be used to pass additional parameters locally e.g
-# INTEGRATION_TESTS_PARAMS="-run TestTraceExec -no-deploy-ig -no-deploy-spo" make integration-tests
+# INTEGRATION_TESTS_PARAMS="-run TestTraceExec -no-deploy-spo" make integration-tests
 .PHONY: integration-tests
 integration-tests: kubectl-gadget
 	KUBECTL_GADGET="$(shell pwd)/kubectl-gadget" \
-		go test ./integration/inspektor-gadget/... \
+		go test ./integration/k8s/... \
 			-v \
 			-integration \
 			-timeout 30m \
 			-k8s-distro $(KUBERNETES_DISTRIBUTION) \
 			-k8s-arch $(KUBERNETES_ARCHITECTURE) \
-			-image $(CONTAINER_REPO):$(IMAGE_TAG) \
 			-dnstester-image $(DNSTESTER_IMAGE) \
 			-gadget-repository $(GADGET_REPOSITORY) \
 			-gadget-tag $(GADGET_TAG) \
+			-test-component $(TEST_COMPONENT) \
 			$$INTEGRATION_TESTS_PARAMS
+
+.PHONY: component-tests
+component-tests:
+	go test -exec sudo -v ./integration/components/... -integration -timeout 5m --builder-image $(EBPF_BUILDER)
 
 .PHONY: generate-documentation
 generate-documentation:
 	go run -tags docs cmd/gen-doc/gen-doc.go -repo $(shell pwd)
 
+.PHONY: website-local-update
+website-local-update:
+	# Check that the website repository is cloned in the parent directory
+	# https://github.com/inspektor-gadget/website
+	# And that "make docs" has been run once
+	test -d ../website/external-docs/inspektor-gadget.git_mainlatest/
+	# Replace the documentation
+	rm -rf ../website/external-docs/inspektor-gadget.git_mainlatest/docs
+	cp -r docs ../website/external-docs/inspektor-gadget.git_mainlatest/
+
 lint:
-	docker build -t linter -f Dockerfiles/linter.Dockerfile --build-arg VERSION=$(LINTER_VERSION) Dockerfiles
+	docker build -t linter -f Dockerfiles/linter.Dockerfile --build-arg IMAGE=$(LINTER_IMAGE) Dockerfiles
 # XDG_CACHE_HOME is necessary to avoid this type of errors:
 # ERRO Running error: context loading failed: failed to load packages: failed to load with go/packages: err: exit status 1: stderr: failed to initialize build cache at /.cache/go-build: mkdir /.cache: permission denied
 # Process 15167 has exited with status 3
@@ -283,13 +322,24 @@ lint:
 		--user $(shell id -u):$(shell id -g) -v $(shell pwd):/app -w /app \
 		linter
 
+.PHONY: clang-format
 clang-format:
-	find ./ -type f \( -iname '*.h' ! -iname "vmlinux.h" \) -o -iname '*.c' -execdir $(CLANG_FORMAT) -i {} \;
+	docker run --rm --name ebpf-object-builder --user $(shell id -u):$(shell id -g) \
+		-v $(shell pwd):/work -w /work $(EBPF_BUILDER) \
+		make clang-format-outside-docker
+
+.PHONY: clang-format-outside-docker
+clang-format-outside-docker:
+	find ./ -type f \( \( -iname '*.h' ! -iname "vmlinux.h" \) -o -iname '*.c' \) -execdir $(CLANG_FORMAT) -i {} \;
 
 # minikube
 LIVENESS_PROBE ?= true
 .PHONY: minikube-deploy
 minikube-deploy: minikube-start gadget-container kubectl-gadget
+	# Remove all resources created by Inspektor Gadget
+	./kubectl-gadget undeploy || true
+	# Remove the image from Minikube
+	$(MINIKUBE) image rm $(CONTAINER_REPO):$(IMAGE_TAG) || true
 	@echo "Image on the host:"
 	docker image list --format "table {{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}" |grep $(CONTAINER_REPO):$(IMAGE_TAG)
 	@echo
@@ -306,9 +356,7 @@ minikube-deploy: minikube-start gadget-container kubectl-gadget
 	$(MINIKUBE) image ls --format=table | grep "$(CONTAINER_REPO)\s*|\s*$(IMAGE_TAG)" || \
 		(echo "Image $(CONTAINER_REPO)\s*|\s*$(IMAGE_TAG) was not correctly loaded into Minikube" && false)
 	@echo
-	# Remove all resources created by Inspektor Gadget.
-	./kubectl-gadget undeploy || true
-	./kubectl-gadget deploy --liveness-probe=$(LIVENESS_PROBE) \
+	./kubectl-gadget deploy --verify-gadgets=$(VERIFY_GADGETS) --liveness-probe=$(LIVENESS_PROBE) \
 		--image-pull-policy=Never
 	kubectl rollout status daemonset -n gadget gadget --timeout 30s
 	@echo "Image used by the gadget pod:"
@@ -344,6 +392,22 @@ build-gadgets: install/ig
 push-gadgets: install/ig
 	$(MAKE) -C gadgets/ push
 
+.PHONY: unit-test-gadgets
+unit-test-gadgets:
+	$(MAKE) -C gadgets/ test-unit
+
+.PHONY: integration-test-gadgets
+integration-test-gadgets: install/ig
+	$(MAKE) -C gadgets/ test-integration
+
+.PHONY: testdata
+testdata:
+	$(MAKE) -C testdata/
+
+.PHONY: go-mod-tidy
+go-mod-tidy:
+	find ./ -type f -name go.mod -execdir go mod tidy \;
+
 .PHONY: help
 help:
 	@echo  'Building targets:'
@@ -353,6 +417,7 @@ help:
 	@echo  '* build		  		- Build all targets marked with [o]'
 	@echo  'o manifests			- Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects'
 	@echo  'o generate			- Generate client API code and DeepCopy related code'
+	@echo  '  go-mod-tidy			- Run go mod tidy for all go modules in the repo'
 	@echo  'o kubectl-gadget		- Build the kubectl plugin'
 	@echo  '  kubectl-gadget-all		- Build the kubectl plugin for all architectures'
 	@echo  '  kubectl-gadget-container	- Build container for kubectl-gadget'
@@ -370,8 +435,9 @@ help:
 	@echo  '  test				- Run unit tests'
 	@echo  '  controller-tests		- Run controllers unit tests'
 	@echo  '  ig-tests			- Run ig manager unit tests'
-	@echo  '  gadgets-unit-tests		- Run gadget unit tests'
-	@echo  '  integration-tests		- Run integration tests'
+	@echo  '  integration-tests		- Run integration tests (deploy IG before running the tests)'
+	@echo  '  integration-test-gadgets	- Run gadgets integration test'
+	@echo  '  unit-test-gadgets		- Run gadgets unit test'
 	@echo  ''
 	@echo  'Installing targets:'
 	@echo  '  install/kubectl-gadget	- Build kubectl plugin and install it in ~/.local/bin'
@@ -384,5 +450,8 @@ help:
 	@echo  '  generate-manifests		- Generate manifests for the gadget deployment'
 	@echo  '  minikube-start		- Start a kubernetes cluster using minikube with the docker driver'
 	@echo  '  minikube-deploy		- Build and deploy the gadget container on minikube with docker driver, the cluster is started if it does not exist'
+	@echo  '  debug-ig			- Build ig and start a debug session using delve'
 	@echo  '  install-headers		- Install headers used to build gadgets in /usr/include/gadget'
 	@echo  '  remove-headers		- Remove headers installed in /usr/include/gadget'
+	@echo  '  testdata			- Build testdata'
+	@echo  '  website-local-update		- Update the documentation in the website repository for testing locally'

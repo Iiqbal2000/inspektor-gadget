@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package tracer is deprecated.
+//
+// Deprecated: Switch to image-based gadgets instead. Check
+// https://github.com/inspektor-gadget/inspektor-gadget/tree/main/examples/gadgets
 package tracer
 
 import (
@@ -29,7 +33,9 @@ const (
 	ParamMinLatency = "min"
 )
 
-type GadgetDesc struct{}
+type GadgetDesc struct {
+	gadgets.GadgetDeprecated
+}
 
 func (g *GadgetDesc) Name() string {
 	return "fsslower"
@@ -63,7 +69,7 @@ func (g *GadgetDesc) ParamDescs() params.ParamDescs {
 			Title:          "Filesystem",
 			DefaultValue:   "ext4",
 			Description:    "Filesystem to trace",
-			PossibleValues: []string{"btrfs", "ext4", "nfs", "xfs"},
+			PossibleValues: []string{"btrfs", "ext4", "fuse", "nfs", "ntfs3", "xfs"},
 		},
 	}
 }

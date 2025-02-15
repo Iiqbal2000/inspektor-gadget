@@ -1,4 +1,4 @@
-// Copyright 2022-2023 The Inspektor Gadget authors
+// Copyright 2022-2024 The Inspektor Gadget authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@ const (
 	MaxCharsUint64 = 20 // 18446744073709551615
 	MaxCharsInt64  = 20 // −9223372036854775808
 	MaxCharsBool   = 5  // false
+	MaxCharsChar   = 1  // 1 character
 )
 
 type subField struct {
@@ -48,6 +49,8 @@ type Attributes struct {
 	Name string `yaml:"name"`
 	// Name of the columns without inherited prefixes
 	RawName string `yaml:"raw_name"`
+	// Alias is an alternative shorter name to be used for header of the column; if not set, the Name will be used
+	Alias string `yaml:"alias"`
 	// Width to reserve for this column
 	Width int `yaml:"width"`
 	// MinWidth will be the minimum width this column will be scaled to when using auto-scaling
@@ -66,6 +69,8 @@ type Attributes struct {
 	FixedWidth bool `yaml:"fixed_width"`
 	// Precision defines how many decimals should be shown on float values, default: 2
 	Precision int `yaml:"precision"`
+	// Hex defines whether the value should be shown as a hexadecimal number
+	Hex bool `yaml:"hex"`
 	// Description can hold a short description of the field that can be used to aid the user
 	Description string `yaml:"description"`
 	// Order defines the default order in which columns are shown
@@ -97,27 +102,7 @@ func (ci *Column[T]) GetAttributes() *Attributes {
 }
 
 func (ci *Column[T]) getWidthFromType() int {
-	switch ci.kind {
-	case reflect.Uint8:
-		return MaxCharsUint8
-	case reflect.Int8:
-		return MaxCharsInt8
-	case reflect.Uint16:
-		return MaxCharsUint16
-	case reflect.Int16:
-		return MaxCharsInt16
-	case reflect.Uint32:
-		return MaxCharsUint32
-	case reflect.Int32:
-		return MaxCharsInt32
-	case reflect.Uint64, reflect.Uint:
-		return MaxCharsUint64
-	case reflect.Int64, reflect.Int:
-		return MaxCharsInt64
-	case reflect.Bool:
-		return MaxCharsBool
-	}
-	return 0
+	return GetWidthFromType(ci.kind)
 }
 
 func (ci *Column[T]) getWidth(params []string) (int, error) {
@@ -208,6 +193,11 @@ func (ci *Column[T]) parseTagInfo(tagInfo []string) error {
 			default:
 				return fmt.Errorf("invalid ellipsis value %q for field %q", params[1], ci.Name)
 			}
+		case "hex":
+			if paramsLen != 1 {
+				return fmt.Errorf("parameter hex on field %q must not have a value", ci.Name)
+			}
+			ci.Hex = true
 		case "fixed":
 			if paramsLen != 1 {
 				return fmt.Errorf("parameter fixed on field %q must not have a value", ci.Name)

@@ -28,7 +28,7 @@ spec:
         # Otherwise, we can have error like:
         # "failed to create server failed to create folder for pinning bpf maps: mkdir /sys/fs/bpf/gadget: permission denied"
         # (For reference, see: https://github.com/inspektor-gadget/inspektor-gadget/runs/3966318270?check_suite_focus=true#step:20:221)
-        container.apparmor.security.beta.kubernetes.io/gadget: "unconfined"
+        container.apparmor.security.beta.kubernetes.io/gadget: {{ .Values.config.appArmorProfile | quote }}
         inspektor-gadget.kinvolk.io/option-hook-mode: "auto"
         # keep aligned with values in pkg/operators/prometheus/prometheus.go
         prometheus.io/scrape: "true"
@@ -43,12 +43,12 @@ spec:
           terminationMessagePolicy: FallbackToLogsOnError
           image: {{ .Values.image.repository }}:{{ include "gadget.image.tag" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: [ "/entrypoint.sh" ]
+          command: [ "/bin/gadgettracermanager", "-serve", "-controller" ]
           lifecycle:
             preStop:
               exec:
                 command:
-                  - "/cleanup.sh"
+                  - "/cleanup"
           livenessProbe:
             exec:
               command:
@@ -72,38 +72,22 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
-            - name: TRACELOOP_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: TRACELOOP_POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: TRACELOOP_POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
             - name: GADGET_IMAGE
               value: "{{ .Values.image.repository }}"
-            - name: INSPEKTOR_GADGET_VERSION
-              value: {{ include "gadget.image.tag" . | quote }}
             - name: INSPEKTOR_GADGET_OPTION_HOOK_MODE
               value: {{ .Values.config.hookMode | quote }}
             - name: INSPEKTOR_GADGET_OPTION_FALLBACK_POD_INFORMER
               value: {{ .Values.config.fallbackPodInformer | quote }}
-            # Make sure to keep these settings in sync with pkg/container-utils/runtime-client/interface.go
-            - name: INSPEKTOR_GADGET_CONTAINERD_SOCKETPATH
-              value: {{ .Values.config.containerdSocketPath | quote }}
-            - name: INSPEKTOR_GADGET_CRIO_SOCKETPATH
-              value: {{ .Values.config.crioSocketPath | quote }}
-            - name: INSPEKTOR_GADGET_DOCKER_SOCKETPATH
-              value: {{ .Values.config.dockerSocketPath | quote }}
             - name: HOST_ROOT
               value: "/host"
             - name: IG_EXPERIMENTAL
               value: {{ .Values.config.experimental | quote }}
+            - name: EVENTS_BUFFER_LENGTH
+              value: {{ .Values.config.eventsBufferLength | quote }}
+            - name: GADGET_TRACER_MANAGER_LOG_LEVEL
+              value: {{ .Values.config.daemonLogLevel | quote }}
           securityContext:
+            readOnlyRootFilesystem: true
             # With hostPID/hostNetwork/privileged [1] set to false, we need to set appropriate
             # SELinux context [2] to be able to mount host directories with correct permissions.
             # This option is ignored if hostPID/hostNetwork/privileged is set to true or SELinux isn't enabled.
@@ -114,108 +98,186 @@ spec:
               type: "spc_t"
             capabilities:
               {{- if not .Values.capabilities }}
+              drop:
+                - ALL
               add:
-                # We need CAP_NET_ADMIN to be able to create BPF link.
-                # Indeed, link_create is called with prog->type which equals
-                # BPF_PROG_TYPE_CGROUP_SKB.
-                # This value is then checked in
-                # bpf_prog_attach_check_attach_type() which also checks if we have
-                # CAP_NET_ADMIN:
-                # https://elixir.bootlin.com/linux/v5.14.14/source/kernel/bpf/syscall.c#L4099
-                # https://elixir.bootlin.com/linux/v5.14.14/source/kernel/bpf/syscall.c#L2967
-                - NET_ADMIN
-
-                # We need CAP_SYS_ADMIN to use Python-BCC gadgets because bcc
-                # internally calls bpf_get_map_fd_by_id() which contains the
-                # following snippet:
-                # if (!capable(CAP_SYS_ADMIN))
-                # 	return -EPERM;
-                # (https://elixir.bootlin.com/linux/v5.10.73/source/kernel/bpf/syscall.c#L3254)
-                #
-                # Details about this are given in:
-                # > The important design decision is to allow ID->FD transition for
-                # CAP_SYS_ADMIN only. What it means that user processes can run
-                # with CAP_BPF and CAP_NET_ADMIN and they will not be able to affect each
-                # other unless they pass FDs via scm_rights or via pinning in bpffs.
-                # ID->FD is a mechanism for human override and introspection.
-                # An admin can do 'sudo bpftool prog ...'. It's possible to enforce via LSM that
-                # only bpftool binary does bpf syscall with CAP_SYS_ADMIN and the rest of user
-                # space processes do bpf syscall with CAP_BPF isolating bpf objects (progs, maps,
-                # links) that are owned by such processes from each other.
-                # (https://lwn.net/Articles/820560/)
-                #
-                # Note that even with a kernel providing CAP_BPF, the above
-                # statement is still true.
+                # We need CAP_SYS_ADMIN for gadgettracermanager due to several
+                # syscalls:
+                # - bpf(): It often checks if SYS_ADMIN is set, among others
+                #   there:
+                #   https://github.com/torvalds/linux/blob/c42d9eeef8e5/kernel/bpf/syscall.c#L2602
+                # - perf_event_open(): The kernel checks if CAP_PERFMON or
+                #   CAP_SYS_ADMIN is set:
+                #   https://github.com/torvalds/linux/blob/c42d9eeef8e5/kernel/events/core.c#L12406-L12409
+                # - fanotify_init(): CAP_SYS_ADMIN is required to use all the
+                #   functionalities offered by fanotify:
+                #   https://github.com/torvalds/linux/blob/c42d9eeef8e5/fs/notify/fanotify/fanotify_user.c#L1404
+                # - fanotify_mark(): This capability is required to setup mount
+                #   or filesystem marks:
+                #   https://github.com/torvalds/linux/blob/c42d9eeef8e5/fs/notify/fanotify/fanotify_user.c#L1745-L1754
+                # - mount(): We need this capability to modify the caller
+                #   namespace:
+                #   https://github.com/torvalds/linux/blob/c42d9eeef8e5/fs/namespace.c#L1844-L1846
+                #   https://github.com/torvalds/linux/blob/c42d9eeef8e5/fs/namespace.c#L3609
+                # - setns(): SYS_ADMIN is needed to install various namespace:
+                #   https://github.com/torvalds/linux/blob/c42d9eeef8e5ba9292eda36fd8e3c11f35ee065c/kernel/nsproxy.c#L574
+                #   https://github.com/torvalds/linux/blob/c42d9eeef8e5/kernel/cgroup/namespace.c#L103-L105
                 - SYS_ADMIN
 
                 # We need this capability to get addresses from /proc/kallsyms.
                 # Without it, addresses displayed when reading this file will be
                 # 0.
-                # Thus, bcc_procutils_each_ksym will never call callback, so KSyms
-                # syms_ vector will be empty and it will return false.
-                # As a consequence, no prefix will be found in
-                # get_syscall_prefix(), so a default prefix (_sys) will be
-                # returned.
-                # Sadly, this default prefix is not used by the running kernel,
-                # which instead uses: __x64_sys_
+                # Indeed, the socket-enricher needs to get the socket_file_ops
+                # to work correctly:
+                # https://github.com/inspektor-gadget/inspektor-gadget/blob/69692d54d951/pkg/gadgets/internal/socketenricher/tracer.go#L75
                 - SYSLOG
 
-                # traceloop gadget uses strace which in turns use ptrace()
-                # syscall.
-                # Within kernel code, ptrace() calls ptrace_attach() which in
-                # turns calls __ptrace_may_access() which calls ptrace_has_cap()
-                # where CAP_SYS_PTRACE is finally checked:
-                # https://elixir.bootlin.com/linux/v5.14.14/source/kernel/ptrace.c#L284
+                # Accessing some procfs files such as /proc/$pid/ns/mnt
+                # requires ptrace capability:
+                # https://github.com/inspektor-gadget/inspektor-gadget/blob/3c51ff5e9f5b/pkg/utils/host/namespaces.go#L65
+                # https://github.com/torvalds/linux/blob/c42d9eeef8e5/fs/proc/namespaces.c#L58
                 - SYS_PTRACE
 
-                # Needed by setrlimit in gadgettracermanager and by the traceloop
-                # gadget.
+                # Needed by RemoveMemlock in gadgettracermanager:
+                # https://github.com/inspektor-gadget/inspektor-gadget/blob/f2b9826fc4ae046415cdee30ee4a25322fd3f0c0/pkg/gadgettracermanager/gadgettracermanager.go#L258
                 - SYS_RESOURCE
 
-                # Needed for gadgets that don't dumb the memory rlimit.
-                # (Currently only applies to BCC python-based gadgets)
+                # Needed by mmap() called by gadgettracermanager:
+                # https://github.com/torvalds/linux/blob/c42d9eeef8e5/mm/mmap.c#L1281
+                # https://github.com/torvalds/linux/blob/c42d9eeef8e5/mm/mmap.c#L1161-L1162
                 - IPC_LOCK
 
-                # Needed by gadgets that open a raw sock like dns and snisnoop
+                # Needed by gadgets that open a raw sock like dns and snisnoop:
+                # https://github.com/inspektor-gadget/inspektor-gadget/blob/3c51ff5e9f5b/gadgets/trace_dns/program.bpf.c#L365-L366
                 - NET_RAW
+
+                # Needed to attach qdiscs and filters to network interfaces. See createClsActQdisc()
+                # and addTCFilter() in pkg/gadgets/internal/tcnetworktracer/tc.go
+                - NET_ADMIN
               {{- else }}
               {{- toYaml .Values.capabilities | nindent 14 }}
               {{- end }}
           volumeMounts:
-            - mountPath: /host
-              name: host
+            - mountPath: /host/bin
+              name: bin
+              readOnly: true
+            # We need to have read/write as we write NRI and OCI config files
+            # here.
+            - mountPath: /host/etc
+              name: etc
+              readOnly: false
+            # We need to have read/write as we write NRI and OCI binaries here.
+            - mountPath: /host/opt
+              name: opt
+              readOnly: false
+            - mountPath: /host/usr
+              name: usr
+              readOnly: true
+            - mountPath: /host/run
+              name: run
+              readOnly: true
+            - mountPath: /host/var
+              name: var
+              readOnly: true
+            # WARNING Despite mounting host proc as readonly, it is possible to
+            # write host file system using symlinks under /host/proc. The
+            # following command, ran from gadget pod, will result in writing to
+            # the host filesystem:
+            # touch /host/proc/1/root/foobar
+            # This limitation comes from Inspektor Gadget needing to be run as
+            # unconfined with regard to AppArmor and having the SYS_PTRACE
+            # capability.
+            - mountPath: /host/proc
+              name: proc
+              readOnly: true
             - mountPath: /run
               name: run
-            - mountPath: /lib/modules
-              name: modules
             - mountPath: /sys/kernel/debug
               name: debugfs
             - mountPath: /sys/fs/cgroup
               name: cgroup
+              readOnly: true
             - mountPath: /sys/fs/bpf
               name: bpffs
+            # We need to add a dedicated volume to store OCI image otherwise it
+            # will fail as the container root filesystem is read only.
+            # For this, we use an emptyDir without size limit.
+            - mountPath: /var/lib/ig
+              name: oci
+            {{- if .Values.config.mountPullSecret }}
+            - mountPath: /var/run/secrets/gadget/pull-secret
+              name: pull-secret
+              readOnly: true
+            {{- end }}
+            - mountPath: /etc/ig
+              name: config
+              readOnly: true
       nodeSelector:
         {{- .Values.nodeSelector | toYaml | nindent 8 }}
       affinity:
         {{- toYaml .Values.affinity | nindent 8 }}
       tolerations:
-        {{- toYaml .Values.tolerations | nindent 8 }}
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+        {{- if .Values.tolerations }}
+          {{- toYaml .Values.tolerations | nindent 8 }}
+        {{ end }}
       volumes:
-        - name: host
+        # /bin is needed to find runc.
+        - name: bin
           hostPath:
-            path: /
+            path: /bin
+        # /etc is needed for several reasons:
+        # 1. entrypoint needs /etc/os-release to print information.
+        # 2. entrypoint needs /etc/nri to handle NRI hooks
+        # 3. entrypoint needs /etc/containers/oci to handle OCI hooks.
+        - name: etc
+          hostPath:
+            path: /etc
+        # /opt is needed for several reasons:
+        # 1. entrypoint needs /opt/nri to handle NRI hooks.
+        # 2. entrypoint needs /opt/hooks/oci to handle OCI hooks.
+        - name: opt
+          hostPath:
+            path: /opt
+        # /usr is needed to find runc.
+        - name: usr
+          hostPath:
+            path: /usr
+        - name: proc
+          hostPath:
+            path: /proc
         - name: run
           hostPath:
             path: /run
+        # /var is needed by container-hook to fanoitfy mark certain directories
+        # e.g. needed in case of docker runtime on minikube (driver=kvm2)
+        - name: var
+          hostPath:
+            path: /var
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup
-        - name: modules
-          hostPath:
-            path: /lib/modules
         - name: bpffs
           hostPath:
             path: /sys/fs/bpf
         - name: debugfs
           hostPath:
             path: /sys/kernel/debug
+        - name: oci
+          emptyDir:
+        {{- if .Values.config.mountPullSecret }}
+        - name: pull-secret
+          secret:
+            defaultMode: 0o400
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+            secretName: gadget-pull-secret
+        {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "gadget.fullname" . }}
+            defaultMode: 0o400

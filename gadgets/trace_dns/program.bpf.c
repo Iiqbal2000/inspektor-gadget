@@ -1,91 +1,140 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Copyright (c) 2021 The Inspektor Gadget authors */
+/* Copyright (c) 2024 The Inspektor Gadget authors */
 
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/in.h>
+#include <linux/tcp.h>
+#include <linux/types.h>
 #include <linux/udp.h>
 #include <sys/socket.h>
+#include <stdbool.h>
 
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#include <gadget/macros.h>
 #include <gadget/types.h>
 
 #define GADGET_TYPE_NETWORKING
 #include <gadget/sockets-map.h>
 
-// Max DNS name length: 255
-// https://datatracker.ietf.org/doc/html/rfc1034#section-3.1
-#define MAX_DNS_NAME 255
+// Don't include <gadget/filesystem.h> in networking gadgets
+#define MAX_STRING_SIZE 4096
 
-#define TASK_COMM_LEN 16
+unsigned long long load_byte(const void *skb,
+			     unsigned long long off) asm("llvm.bpf.load.byte");
+unsigned long long load_half(const void *skb,
+			     unsigned long long off) asm("llvm.bpf.load.half");
+unsigned long long load_word(const void *skb,
+			     unsigned long long off) asm("llvm.bpf.load.word");
 
-// Maximum number of A or AAAA answers to include in the DNS event.
-// The DNS reply could have more answers than this, but the additional
-// answers won't be sent to userspace.
-#define MAX_ADDR_ANSWERS 1
-
-struct event_t {
-	__u64 timestamp;
-
-	struct gadget_l4endpoint_t src;
-	struct gadget_l4endpoint_t dst;
-
-	mnt_ns_id_t mntns_id;
-	__u32 netns;
-	__u32 pid;
-	__u32 tid;
-	__u32 uid;
-	__u32 gid;
-	__u8 task[TASK_COMM_LEN];
-
-	__u16 id;
-	unsigned short qtype;
-
-	// qr says if the dns message is a query (0), or a response (1)
-	unsigned char qr;
-	unsigned char pkt_type;
-	unsigned char rcode;
-
-	__u64 latency_ns; // Set only if qr is 1 (response) and pkt_type is 0 (Host).
-
-	__u8 name[MAX_DNS_NAME];
-
-	__u16 ancount;
-	__u16 anaddrcount;
-	__u8 anaddr[MAX_ADDR_ANSWERS]
-		   [16]; // Either IPv4-mapped-IPv6 (A record) or IPv6 (AAAA record) addresses.
-};
-
-#define DNS_OFF (ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr))
-
-#define DNS_CLASS_IN \
-	1 // https://datatracker.ietf.org/doc/html/rfc1035#section-3.2.4
-#define DNS_TYPE_A \
-	1 // https://datatracker.ietf.org/doc/html/rfc1035#section-3.2.2
-#define DNS_TYPE_AAAA 28 // https://www.rfc-editor.org/rfc/rfc3596#section-2.1
-
-#ifndef PACKET_HOST
-#define PACKET_HOST 0x0
-#endif
-
-#ifndef PACKET_OUTGOING
-#define PACKET_OUTGOING 0x4
+#ifndef NEXTHDR_HOP
+#define NEXTHDR_HOP 0 /* Hop-by-hop option header. */
+#define NEXTHDR_TCP 6 /* TCP segment. */
+#define NEXTHDR_UDP 17 /* UDP message. */
+#define NEXTHDR_ROUTING 43 /* Routing header. */
+#define NEXTHDR_FRAGMENT 44 /* Fragmentation/reassembly header. */
+#define NEXTHDR_AUTH 51 /* Authentication header. */
+#define NEXTHDR_NONE 59 /* No next header */
+#define NEXTHDR_DEST 60 /* Destination options header. */
 #endif
 
 #define DNS_QR_QUERY 0
 #define DNS_QR_RESP 1
 
-// we need this to make sure the compiler doesn't remove our struct
-const struct event_t *unusedevent __attribute__((unused));
+#define MAX_PORTS 16
+const volatile __u16 ports[MAX_PORTS] = { 53, 5353 };
+const volatile __u16 ports_len = 2;
+const volatile bool paths = false;
+GADGET_PARAM(paths);
+
+static __always_inline bool is_dns_port(__u16 port)
+{
+	for (int i = 0; i < ports_len; i++) {
+		if (ports[i] == port)
+			return true;
+	}
+	return false;
+}
+
+enum pkt_type_t : __u8 {
+	HOST,
+	BROADCAST,
+	MULTICAST,
+	OTHERHOST,
+	OUTGOING,
+	LOOPBACK,
+	USER,
+	KERNEL,
+};
+
+// TODO: what's a reasonable value for this?
+// Or can we remove this altogether?
+#define MAX_PACKET (1024 * 9) // 9KB
+
+struct event_t {
+	gadget_timestamp timestamp_raw;
+	struct gadget_l4endpoint_t src;
+	struct gadget_l4endpoint_t dst;
+	gadget_netns_id netns_id;
+	struct gadget_process proc;
+	char cwd[MAX_STRING_SIZE];
+	char exepath[MAX_STRING_SIZE];
+
+	enum pkt_type_t pkt_type_raw;
+	gadget_duration
+		latency_ns_raw; // Set only if the packet is a response and pkt_type is 0 (Host).
+
+	__u16 dns_off; // DNS offset in the packet
+	__u32 data_len;
+
+	// Only on this structure
+	__u8 data[MAX_PACKET];
+};
+
+// TODO: We need this header structure as the packet itself is appended by
+// bpf_perf_event_output(). Hence the event we send over the perf ring buffer is
+// only the header without the packet. We can use the full structure above as
+// it exceeds the stack limit of 512 bytes in bpf.
+// TODO: We'll need to find a clearer way to implement this
+struct event_header_t {
+	gadget_timestamp timestamp_raw;
+	struct gadget_l4endpoint_t src;
+	struct gadget_l4endpoint_t dst;
+	gadget_netns_id netns_id;
+	struct gadget_process proc;
+	char cwd[MAX_STRING_SIZE];
+	char exepath[MAX_STRING_SIZE];
+
+	enum pkt_type_t pkt_type_raw;
+	gadget_duration
+		latency_ns_raw; // Set only if the packet is a response and pkt_type is 0 (Host).
+
+	__u16 dns_off; // DNS offset in the packet
+	__u32 data_len;
+};
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
 	__uint(key_size, sizeof(__u32));
-	__type(value, struct event_t);
-} print_events SEC(".maps");
+	__uint(value_size, sizeof(__u32));
+} events SEC(".maps");
+
+GADGET_TRACER(dns, events, event_t);
+
+// Cannot use gadget_reserve_buf() because this does not support
+// bpf_perf_event_output with packet appended
+static const struct gadget_process empty_proc = {};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(struct event_t));
+} tmp_events SEC(".maps");
 
 // https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.1
 union dnsflags {
@@ -96,13 +145,13 @@ union dnsflags {
 		__u8 ra : 1; // recursion available
 		__u8 rd : 1; // recursion desired
 		__u8 tc : 1; // truncation
-		__u8 aa : 1; // authoritive answer
+		__u8 aa : 1; // authoritative answer
 		__u8 opcode : 4; // kind of query
 		__u8 qr : 1; // 0=query; 1=response
 #elif __BYTE_ORDER == __ORDER_BIG_ENDIAN__
 		__u8 qr : 1; // 0=query; 1=response
 		__u8 opcode : 4; // kind of query
-		__u8 aa : 1; // authoritive answer
+		__u8 aa : 1; // authoritative answer
 		__u8 tc : 1; // truncation
 		__u8 rd : 1; // recursion desired
 		__u8 ra : 1; // recursion available
@@ -126,30 +175,11 @@ struct dnshdr {
 	__u16 arcount; // number of additional records
 };
 
-// DNS resource record
-// https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.3
-#pragma pack(2)
-struct dnsrr {
-	__u16 name; // Two octets when using message compression, see https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.4
-	__u16 type;
-	__u16 class;
-	__u32 ttl;
-	__u16 rdlength;
-	// Followed by rdata
-};
-
-// The stack is limited, so use a map to build the event
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct event_t);
-} tmp_event SEC(".maps");
-
 // Map of DNS query to timestamp so we can calculate latency from query sent to answer received.
 struct query_key_t {
 	__u64 pid_tgid;
 	__u16 id;
+	__u16 pad[3]; // this is needed, otherwise the verifier claims an invalid read from stack
 };
 
 struct {
@@ -159,159 +189,153 @@ struct {
 	__uint(max_entries, 1024);
 } query_map SEC(".maps");
 
-static __always_inline __u32 dns_name_length(struct __sk_buff *skb)
+SEC("socket1")
+int ig_trace_dns(struct __sk_buff *skb)
 {
-	// This loop iterates over the DNS labels to find the total DNS name
-	// length.
-	unsigned int i;
-	unsigned int skip = 0;
-	for (i = 0; i < MAX_DNS_NAME; i++) {
-		if (skip != 0) {
-			skip--;
-		} else {
-			int label_len = load_byte(
-				skb, DNS_OFF + sizeof(struct dnshdr) + i);
-			if (label_len == 0)
+	struct event_header_t *event;
+	int zero = 0;
+	__u16 sport, dport, l4_off, dns_off, h_proto, id;
+	__u8 proto;
+	int i;
+
+	// Do a first pass only to extract the port and drop the packet if it's not DNS
+	h_proto = load_half(skb, offsetof(struct ethhdr, h_proto));
+	switch (h_proto) {
+	case ETH_P_IP:
+		proto = load_byte(skb,
+				  ETH_HLEN + offsetof(struct iphdr, protocol));
+		// An IPv4 header doesn't have a fixed size. The IHL field of a packet
+		// represents the size of the IP header in 32-bit words, so we need to
+		// multiply this value by 4 to get the header size in bytes.
+		__u8 ihl_byte = load_byte(skb, ETH_HLEN);
+		struct iphdr *iph = (struct iphdr *)&ihl_byte;
+		__u8 ip_header_len = iph->ihl * 4;
+		l4_off = ETH_HLEN + ip_header_len;
+		break;
+
+	case ETH_P_IPV6:
+		proto = load_byte(skb,
+				  ETH_HLEN + offsetof(struct ipv6hdr, nexthdr));
+		l4_off = ETH_HLEN + sizeof(struct ipv6hdr);
+
+// Parse IPv6 extension headers
+// Up to 6 extension headers can be chained. See ipv6_ext_hdr().
+#pragma unroll
+		for (i = 0; i < 6; i++) {
+			__u8 nextproto;
+
+			// TCP or UDP found
+			if (proto == NEXTHDR_TCP || proto == NEXTHDR_UDP)
 				break;
-			// The simple solution "i += label_len" gives verifier
-			// errors, so work around with skip.
-			skip = label_len;
+
+			nextproto = load_byte(skb, l4_off);
+
+			// Unfortunately, each extension header has a different way to calculate the header length.
+			// Support the ones defined in ipv6_ext_hdr(). See ipv6_skip_exthdr().
+			switch (proto) {
+			case NEXTHDR_FRAGMENT:
+				// No hdrlen in the fragment header
+				l4_off += 8;
+				break;
+			case NEXTHDR_AUTH:
+				// See ipv6_authlen()
+				l4_off += 4 * (load_byte(skb, l4_off + 1) + 2);
+				break;
+			case NEXTHDR_HOP:
+			case NEXTHDR_ROUTING:
+			case NEXTHDR_DEST:
+				// See ipv6_optlen()
+				l4_off += 8 * (load_byte(skb, l4_off + 1) + 1);
+				break;
+			case NEXTHDR_NONE:
+				// Nothing more in the packet. Not even TCP or UDP.
+				return 0;
+			default:
+				// Unknown header
+				return 0;
+			}
+			proto = nextproto;
 		}
+		break;
+
+	default:
+		return 0;
 	}
 
-	return i < MAX_DNS_NAME ? i : MAX_DNS_NAME;
-}
-
-// Save the IPv4 and IPv6 addresses in event->anaddr. Returns the number of saved addresses.
-static __always_inline int load_addresses(struct __sk_buff *skb, int ancount,
-					  int anoffset, struct event_t *event)
-{
-	int rroffset = anoffset;
-	int index = 0;
-	for (int i = 0; i < ancount && i < MAX_ADDR_ANSWERS; i++) {
-		__u16 rrname =
-			load_byte(skb, rroffset + offsetof(struct dnsrr, name));
-
-		// In most cases, the name will be compressed to two octets (indicated by first two bits 0b11).
-		// The offset calculations below assume compression, so exit early if the name isn't compressed.
-		if ((rrname & 0xf0) != 0xc0)
-			return 0;
-
-		// Safe to assume that all answers refer to the same domain name
-		// because we verified earlier that there's exactly one question.
-
-		__u16 rrtype =
-			load_half(skb, rroffset + offsetof(struct dnsrr, type));
-		__u16 rrclass = load_half(skb, rroffset + offsetof(struct dnsrr,
-								   class));
-		__u16 rdlength = load_half(
-			skb, rroffset + offsetof(struct dnsrr, rdlength));
-
-		if (rrtype == DNS_TYPE_A && rrclass == DNS_CLASS_IN &&
-		    rdlength == 4) {
-			// A record contains an IPv4 address.
-			// Encode this as IPv4-mapped-IPv6 in the BPF event (::ffff:<ipv4>)
-			// https://datatracker.ietf.org/doc/html/rfc4291#section-2.5.5.2
-			__builtin_memset(&event->anaddr[index][0], 0x0, 10);
-			__builtin_memset(&event->anaddr[index][10], 0xff, 2);
-			bpf_skb_load_bytes(skb, rroffset + sizeof(struct dnsrr),
-					   &event->anaddr[index][12], rdlength);
-			index++;
-		} else if (rrtype == DNS_TYPE_AAAA && rrclass == DNS_CLASS_IN &&
-			   rdlength == 16) {
-			// AAAA record contains an IPv6 address.
-			bpf_skb_load_bytes(skb, rroffset + sizeof(struct dnsrr),
-					   &event->anaddr[index][0], rdlength);
-			index++;
-		}
-		rroffset += sizeof(struct dnsrr) + rdlength;
+	switch (proto) {
+	case IPPROTO_UDP:
+		sport = load_half(skb,
+				  l4_off + offsetof(struct udphdr, source));
+		dport = load_half(skb, l4_off + offsetof(struct udphdr, dest));
+		dns_off = l4_off + sizeof(struct udphdr);
+		break;
+	// TODO: support TCP
+	default:
+		return 0;
 	}
-	return index;
-}
 
-static __always_inline int output_dns_event(struct __sk_buff *skb,
-					    union dnsflags flags,
-					    __u32 name_len, __u16 ancount)
-{
-	__u32 zero = 0;
-	struct event_t *event = bpf_map_lookup_elem(&tmp_event, &zero);
-	if (!event)
+	if (!is_dns_port(sport) && !is_dns_port(dport))
 		return 0;
 
-	__builtin_memset(event, 0, sizeof(*event));
+	event = bpf_map_lookup_elem(&tmp_events, &zero);
+	if (!event)
+		return 0; // it never happens
 
-	event->netns = skb->cb[0]; // cb[0] initialized by dispatcher.bpf.c
-	event->timestamp = bpf_ktime_get_boot_ns();
-	event->id = load_half(skb, DNS_OFF + offsetof(struct dnshdr, id));
-
-	event->src.l3.version = event->dst.l3.version = 4;
-	event->dst.l3.addr.v4 =
-		load_word(skb, ETH_HLEN + offsetof(struct iphdr, daddr));
-	event->src.l3.addr.v4 =
-		load_word(skb, ETH_HLEN + offsetof(struct iphdr, saddr));
-	// load_word converts from network to host endianness. Convert back to
-	// network endianness as required by gadget_l4endpoint_t.
-	event->dst.l3.addr.v4 = bpf_htonl(event->dst.l3.addr.v4);
-	event->src.l3.addr.v4 = bpf_htonl(event->src.l3.addr.v4);
-
-	// Check network protocol.
-	// This only works with IPv4.
-	// For IPv6, gadget_socket_lookup() in pkg/gadgets/internal/socketenricher/bpf/sockets-map.h
-	// provides an example how to parse ip/ports on IPv6.
-	event->src.proto = event->dst.proto =
-		load_byte(skb, ETH_HLEN + offsetof(struct iphdr, protocol));
-	if (event->src.proto == IPPROTO_TCP) {
-		event->src.port =
-			load_half(skb, ETH_HLEN + sizeof(struct iphdr) +
-					       offsetof(struct tcphdr, source));
-		event->dst.port =
-			load_half(skb, ETH_HLEN + sizeof(struct iphdr) +
-					       offsetof(struct tcphdr, dest));
-	} else if (event->src.proto == IPPROTO_UDP) {
-		event->src.port =
-			load_half(skb, ETH_HLEN + sizeof(struct iphdr) +
-					       offsetof(struct udphdr, source));
-		event->dst.port =
-			load_half(skb, ETH_HLEN + sizeof(struct iphdr) +
-					       offsetof(struct udphdr, dest));
+	// As an optimization, only clear the fields that can be skipped below.
+	event->latency_ns_raw = 0;
+	event->proc = empty_proc;
+	if (paths) {
+		event->cwd[0] = '\0';
+		event->exepath[0] = '\0';
 	}
 
-	event->qr = flags.qr;
+	event->timestamp_raw = bpf_ktime_get_boot_ns();
+	event->netns_id = skb->cb[0]; // cb[0] initialized by dispatcher.bpf.c
+	event->data_len = skb->len;
+	event->dns_off = dns_off;
+	event->pkt_type_raw = skb->pkt_type;
+	event->src.proto_raw = event->dst.proto_raw = proto;
+	event->src.port = sport;
+	event->dst.port = dport;
 
-	if (flags.qr == 1) {
-		// Response code set only for replies.
-		event->rcode = flags.rcode;
+	// The packet is DNS: Do a second pass to extract all the information we need
+	switch (h_proto) {
+	case ETH_P_IP:
+		event->src.version = event->dst.version = 4;
+		event->dst.addr_raw.v4 = load_word(
+			skb, ETH_HLEN + offsetof(struct iphdr, daddr));
+		event->src.addr_raw.v4 = load_word(
+			skb, ETH_HLEN + offsetof(struct iphdr, saddr));
+		// load_word converts from network to host endianness. Convert back to
+		// network endianness because Inspektor Gadget needs this format for IP addresses.
+		event->src.addr_raw.v4 = bpf_htonl(event->src.addr_raw.v4);
+		event->dst.addr_raw.v4 = bpf_htonl(event->dst.addr_raw.v4);
+		break;
+	case ETH_P_IPV6:
+		event->src.version = event->dst.version = 6;
+		if (bpf_skb_load_bytes(
+			    skb, ETH_HLEN + offsetof(struct ipv6hdr, saddr),
+			    &event->src.addr_raw.v6,
+			    sizeof(event->src.addr_raw.v6)))
+			return 0;
+		if (bpf_skb_load_bytes(
+			    skb, ETH_HLEN + offsetof(struct ipv6hdr, daddr),
+			    &event->dst.addr_raw.v6,
+			    sizeof(event->dst.addr_raw.v6)))
+			return 0;
+		break;
 	}
-
-	bpf_skb_load_bytes(skb, DNS_OFF + sizeof(struct dnshdr), event->name,
-			   name_len);
-
-	event->pkt_type = skb->pkt_type;
-
-	// Read QTYPE right after the QNAME (name_len + the zero length octet)
-	// https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.2
-	event->qtype =
-		load_half(skb, DNS_OFF + sizeof(struct dnshdr) + name_len + 1);
 
 	// Enrich event with process metadata
 	struct sockets_value *skb_val = gadget_socket_lookup(skb);
-	if (skb_val != NULL) {
-		event->mntns_id = skb_val->mntns;
-		event->pid = skb_val->pid_tgid >> 32;
-		event->tid = (__u32)skb_val->pid_tgid;
-		__builtin_memcpy(&event->task, skb_val->task,
-				 sizeof(event->task));
-		event->uid = (__u32)skb_val->uid_gid;
-		event->gid = (__u32)(skb_val->uid_gid >> 32);
+	gadget_process_populate_from_socket(skb_val, &event->proc);
+	if (paths) {
+		bpf_probe_read_kernel_str(&event->cwd, sizeof(event->cwd),
+					  skb_val->cwd);
+		bpf_probe_read_kernel_str(&event->exepath,
+					  sizeof(event->exepath),
+					  skb_val->exepath);
 	}
-
-	event->ancount = ancount;
-
-	// DNS answers start immediately after qname (name_len octets)
-	// + the zero length octet + qtype (2 octets) + qclass (2 octets).
-	int anoffset = DNS_OFF + sizeof(struct dnshdr) + name_len + 5;
-	int anaddrcount = load_addresses(skb, ancount, anoffset, event);
-	event->anaddrcount = anaddrcount;
 
 	// Calculate latency:
 	//
@@ -330,72 +354,43 @@ static __always_inline int output_dns_event(struct __sk_buff *skb,
 	// Skip this if skb_val == NULL (gadget_socket_lookup did not set pid_tgid we use in the query key)
 	// or if event->timestamp == 0 (kernels before 5.8 don't support bpf_ktime_get_boot_ns, and the patched
 	// version IG injects always returns zero).
-	if (skb_val != NULL && event->timestamp > 0) {
+	if (skb_val != NULL && event->timestamp_raw > 0) {
+		union dnsflags flags;
+		flags.flags = load_half(skb, dns_off + offsetof(struct dnshdr,
+								flags));
+		id = load_half(skb, dns_off + offsetof(struct dnshdr, id));
+		__u8 qr = flags.qr;
+
 		struct query_key_t query_key = {
 			.pid_tgid = skb_val->pid_tgid,
-			.id = event->id,
+			.id = id,
 		};
-		if (event->qr == DNS_QR_QUERY &&
-		    event->pkt_type == PACKET_OUTGOING) {
+		if (qr == DNS_QR_QUERY && event->pkt_type_raw == OUTGOING) {
 			bpf_map_update_elem(&query_map, &query_key,
-					    &event->timestamp, BPF_NOEXIST);
-		} else if (event->qr == DNS_QR_RESP &&
-			   event->pkt_type == PACKET_HOST) {
+					    &event->timestamp_raw, BPF_NOEXIST);
+		} else if (flags.qr == DNS_QR_RESP &&
+			   event->pkt_type_raw == HOST) {
 			__u64 *query_ts =
 				bpf_map_lookup_elem(&query_map, &query_key);
 			if (query_ts != NULL) {
 				// query ts should always be less than the event ts, but check anyway to be safe.
-				if (*query_ts < event->timestamp) {
-					event->latency_ns =
-						event->timestamp - *query_ts;
+				if (*query_ts < event->timestamp_raw) {
+					event->latency_ns_raw =
+						event->timestamp_raw -
+						*query_ts;
 				}
 				bpf_map_delete_elem(&query_map, &query_key);
 			}
 		}
 	}
 
-	// size of full structure - addresses + only used addresses
-	unsigned long long size =
-		sizeof(*event); // - MAX_ADDR_ANSWERS * 16 + anaddrcount * 16;
-	bpf_perf_event_output(skb, &print_events, BPF_F_CURRENT_CPU, event,
-			      size);
+	__u64 skb_len = skb->len;
+	if (skb_len > MAX_PACKET)
+		skb_len = MAX_PACKET;
+	bpf_perf_event_output(skb, &events, skb_len << 32 | BPF_F_CURRENT_CPU,
+			      event, sizeof(*event));
 
 	return 0;
-}
-
-SEC("socket1")
-int ig_trace_dns(struct __sk_buff *skb)
-{
-	// Skip non-IP packets
-	if (load_half(skb, offsetof(struct ethhdr, h_proto)) != ETH_P_IP)
-		return 0;
-
-	// Skip non-UDP packets
-	if (load_byte(skb, ETH_HLEN + offsetof(struct iphdr, protocol)) !=
-	    IPPROTO_UDP)
-		return 0;
-
-	union dnsflags flags;
-	flags.flags = load_half(skb, DNS_OFF + offsetof(struct dnshdr, flags));
-
-	// Skip DNS packets with more than 1 question
-	if (load_half(skb, DNS_OFF + offsetof(struct dnshdr, qdcount)) != 1)
-		return 0;
-
-	__u16 ancount =
-		load_half(skb, DNS_OFF + offsetof(struct dnshdr, ancount));
-	__u16 nscount =
-		load_half(skb, DNS_OFF + offsetof(struct dnshdr, nscount));
-
-	// Skip DNS queries with answers
-	if (flags.qr == 0 && ancount + nscount != 0)
-		return 0;
-
-	__u32 name_len = dns_name_length(skb);
-	if (name_len == 0)
-		return 0;
-
-	return output_dns_event(skb, flags, name_len, ancount);
 }
 
 char _license[] SEC("license") = "GPL";
